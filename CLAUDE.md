@@ -71,9 +71,87 @@ expand scope or merge phases without explicit approval.**
 | **3C** | Writeback to **original** Curves data works. Direct assignment and `foreach_set` both succeed. `obj.data.update_tag()` + re-`evaluated_depsgraph_get()` propagates to evaluated data. Surface Deform consumes original positions (applies a roughly linear ~0.91× transform on the offset before reaching evaluated coords). Viewport visibly changes once enough strands are moved (~1000+) | (MCP only) |
 | **3D** | Full-frame writeback (all 35,792 points). Per-frame deformation total ≈ **46 ms**: depsgraph re-eval **37 ms (~81%)**, Python loop 6.4 ms, foreach_get+set 0.14 ms combined | (MCP only) |
 | **3E** | Temporary `frame_change_post` handler drives non-cumulative deformation across frames 800–840. Deterministic (revisit same frame → same shape), Phase 1 handler count unaffected, handler removed cleanly after test. ~110 ms/frame end-to-end via `frame_set` | (MCP only) |
+| **4A** | `describe_curves(name, counts, attribute fingerprint, ...)` in `native/probe.cpp`. Metadata-only round-trip Python → C++ → Python via `py::dict`. UTF-8 string round-trip OK | `fabf63c` |
+| **4B** | `probe_position_buffer(metadata, py::buffer)`. Read-only ingest of one frame's float32 buffer (107,376 floats) via the Python buffer protocol. Both `array.array('f')` and `bytearray+memoryview.cast('f')` accepted identically. Computes min/max/sum/avg/checksum; returns dict. Pointer not retained; input not mutated. `first_vec3` matches Phase 3B baseline bit-for-bit | `5698baa` |
+| **4C** | `deform_position_buffer(metadata, amplitude, py::buffer)` returns a **new** `py::bytes` result buffer alongside summary. Deterministic per-strand z-offset: root 0, tip +amplitude, linear interpolation. Input not mutated; result memory is Python-owned. `checksum_delta` matches closed-form theory (`amplitude × 4 × n_strands`) | `c96d147` |
+| **4D** | First end-to-end round-trip Blender↔C++↔Blender attempted with **evaluated→original** writeback. **Mechanically passed all API checks** but caused a double Surface Deform application — hair detached from head (`eval_first` shifted from -0.319 to -0.620). Documented as the textbook landmine #2 outcome; path **rejected as the canonical route** | (MCP only) |
+| **4D2** | Canonical round-trip: **original→C++→original**. Hair deforms naturally and stays attached to the head. Root completely fixed (eval delta = (0,0,0)), tip lifts (eval z delta +0.236 from input +0.25). Surface Deform applies its transform once on the modified rest pose | (MCP only) |
+| **4E** | Time-driven non-cumulative C++ deformation across frames 800–840 via temporary `frame_change_post` handler. C++ replaces Phase 3E's pure Python loop: handler-internal cost **0.24 ms** (vs 12 ms in 3E, ~50× faster). 1-frame end-to-end stays at ~100 ms because Blender-side depsgraph/Surface Deform/rig dominates. Determinism, baseline restore, handler cleanup, Phase 1 invariants all verified | (MCP only) |
 
-**Phase 3 left no repo changes by design** (MCP-only investigations).
-HEAD remains at `4c7e0ec` (Phase 2D).
+**Phase 3 left no repo changes by design.** Phases 4D, 4D2, 4E left no
+repo changes either (MCP-only). The committed Phase 4 surface is
+`4A` + `4B` + `4C` in `native/probe.cpp`.
+
+---
+
+## Performance stance (Phase 4 conclusion — load-bearing)
+
+After Phase 4E, per-call cost is dissected as follows for the
+YOKO__EXT_TEST.blend / カーブ.001 scene (35,792 points, single Curves
+object, Surface Deform Geometry Nodes + Armature rig):
+
+| Layer | Per-frame cost | Status |
+|---|---|---|
+| C++ deformation (`deform_position_buffer`) | ~0.14 ms | negligible |
+| Python ↔ C++ buffer transfer (in/out, copy via `py::bytes`) | ~0.10 ms total | negligible |
+| `foreach_get` / `foreach_set` on 107,376 floats | ~0.10 ms total | negligible |
+| **Blender depsgraph + Surface Deform + rig evaluation** | **~95–100 ms** | **dominant, accepted** |
+
+**Stance:**
+
+1. The hair-extension code path (C++ deform + buffer transfer +
+   foreach_get/set) is **already fast enough** for the foreseeable
+   roadmap. Further micro-optimization there is wasted effort.
+2. The dominant cost is **the existing rig** (Surface Deform on
+   `カーブ.001`, Armature on the body meshes, etc.). This is **not**
+   the extension's cost; it is the scene's cost.
+3. Surface Deform **cannot be removed** in this scene. It is the
+   mechanism that attaches hair curves to the body. Any path that
+   bypasses it implies consuming a *baked* dataset instead of the live
+   rig output.
+4. Surface Deform / Geometry Nodes integration, modifier reordering,
+   custom evaluators, and rig replacement are **explicitly out of
+   scope** for the current line of work. Do not propose or implement
+   them without an explicit go-ahead.
+5. When benchmarking future phases, attribute costs to either
+   "extension code" or "scene rig" and do not optimize the latter.
+
+---
+
+## Canonical data round-trip (after Phase 4D2)
+
+The official boundary path for all subsequent work is:
+
+```
+obj.data.attributes["position"]              ← ORIGINAL space
+        │                          (foreach_get into array.array('f'))
+        ▼
+   Python buffer (input)
+        │
+        ▼
+native.deform_position_buffer(...)            ← C++ reads buffer,
+        │                                       writes new result
+        ▼
+   Python buffer (result via py::bytes)
+        │              (array.array('f').frombytes)
+        ▼
+obj.data.attributes["position"]              ← ORIGINAL space
+        │                          (foreach_set)
+        ▼
+obj.data.update_tag()
+        │
+        ▼
+evaluated_depsgraph_get() / viewport         ← Surface Deform applies
+                                                exactly once here
+```
+
+**Forbidden anti-pattern (Phase 4D):**
+- Read **evaluated** + write **original** → double Surface Deform →
+  hair flies off head.
+
+Whenever the round-trip is touched in a future phase, this diagram
+applies. If a phase needs to deviate (e.g., the future "consume baked
+data" path), it must be designed and acknowledged explicitly.
 
 ---
 
@@ -102,12 +180,15 @@ entry (`feedback_curves_landmines.md`); read both.
    Phase 3E proved the path works as a one-off; production wiring is a
    separate risk class (timing, viewport, threading) and needs its own
    phase.
-8. **In the Curves-validation branch, never introduce PhysX / CUDA /
-   GPU / C++ transfer / numpy / SolverInterface wiring.** Those are
-   deferred and must remain deferred until explicitly unblocked.
-9. **Don't over-optimize foreach_get/set.** They are µs-class.
-   Dominant cost is `frame_set` + depsgraph + Surface Deform
-   (~60–110 ms/frame). Optimize the right end.
+8. **PhysX / CUDA / GPU / numpy / SolverInterface wiring stay
+   deferred.** C++ transfer was promoted in Phase 4 (it is now the
+   canonical round-trip), but the rest of this list must remain
+   deferred until explicitly unblocked.
+9. **Don't over-optimize foreach_get/set or the C++ deformation
+   itself.** They are sub-ms. Dominant cost is `frame_set` +
+   depsgraph + Surface Deform + rig (~95–110 ms/frame). This cost
+   belongs to the existing scene rig, not to the extension, and is
+   explicitly out of scope (see "Performance stance" above).
 10. **No single giant contiguous allocation.** Work in chunked
     contiguous buffers (per-frame / N-frame chunk / strand-group).
     Working tentative direction: "chunked contiguous + float32."
@@ -208,18 +289,21 @@ arrives.
 
 ## Pending / next phase candidates (not yet designed)
 
-These are *candidates* surfaced by Phase 3 results. None are committed
-to. Each needs its own design pass + user GO before implementation:
+These are *candidates*. None are committed to. Each needs its own
+design pass + user GO before implementation:
 
-* **Phase 3F (?)** — turn the Phase 3E proof-of-concept into a
-  reviewable operator or design note. Still pure Python, still no
-  native, still no SolverInterface wiring.
-* **Phase 3G (?)** — bench the cost of chunked buffers across a longer
-  frame range (still Python).
-* **Phase 4 (?)** — first SolverInterface wiring (still no PhysX): use
-  the existing pybind11 boundary to compute trivial per-frame
-  transformation in native code, measure round-trip latency.
-* **Phase 5+ (?)** — PhysX SDK, CUDA, GPU integration. Far away.
+* **Phase 5 (?)** — SolverInterface wiring: replace the Python stub
+  body of `start / stop / reset / step` with calls into the
+  Phase 4D2 canonical round-trip. Still no PhysX; the C++ side is
+  the Phase 4C deterministic deformation. Mind landmine #7
+  (permanent `frame_change_post` wiring is a separate risk class).
+* **Phase 6 (?)** — replace the placeholder deformation with a real
+  (still simple) physics-ish update in C++: gravity, inertia, fixed
+  root constraint. Per-Object solver state. Still no PhysX SDK.
+* **Phase 7 (?)** — Curves bake path: investigate consuming a baked
+  dataset so Surface Deform can be bypassed when desired. Out of
+  scope for normal operation.
+* **Phase 8+ (?)** — PhysX SDK, CUDA, GPU integration. Far away.
   Quarantined `phase2-cpp` branch has reference material.
 
 When a new phase begins, do not skip steps:
