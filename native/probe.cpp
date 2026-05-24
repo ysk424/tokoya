@@ -1,6 +1,6 @@
-// Phase 2B/4A/4B/4C/5A placeholder module. Module name, function names,
-// and phase attribute are experimental and will change before any real
-// solver wiring.
+// Phase 2B/4A/4B/4C/5A/5B placeholder module. Module name, function
+// names, and phase attribute are experimental and will change before
+// any real solver wiring.
 //
 // Phase history of this file:
 //   4A: describe_curves           (metadata round-trip only)
@@ -11,11 +11,15 @@
 //   5A: physx_probe_open/status/close   (PhysX 5 CPU-only lifecycle;
 //                                        no simulation, no rigid bodies,
 //                                        no collision, no GPU)
+//   5B: physx_probe_step          (empty-Scene simulate(dt)/fetchResults;
+//                                  still no rigid bodies, no collision,
+//                                  no Curves, no GPU)
 #include <pybind11/pybind11.h>
 
 #include <PxPhysicsAPI.h>
 
 #include <cstddef>
+#include <exception>
 #include <string>
 #include <vector>
 
@@ -270,6 +274,10 @@ PxDefaultCpuDispatcher*  g_dispatcher  = nullptr;
 PxScene*                 g_scene       = nullptr;
 PxMaterial*              g_material    = nullptr;
 
+// Phase 5B: step probe state. Reset to zero in physx_probe_close().
+unsigned long long       g_step_count  = 0ULL;
+float                    g_last_dt     = 0.0f;
+
 }  // anonymous namespace
 
 py::dict physx_probe_open()
@@ -349,14 +357,100 @@ py::dict physx_probe_open()
 
 py::dict physx_probe_status()
 {
+    const bool has_foundation = (g_foundation != nullptr);
+    const bool has_physics    = (g_physics    != nullptr);
+    const bool has_dispatcher = (g_dispatcher != nullptr);
+    const bool has_scene      = (g_scene      != nullptr);
+    const bool has_material   = (g_material   != nullptr);
+    const bool opened         = has_foundation;
+
     py::dict d;
-    d["foundation_ptr_nonnull"] = (g_foundation != nullptr);
-    d["physics_ptr_nonnull"]    = (g_physics    != nullptr);
-    d["dispatcher_ptr_nonnull"] = (g_dispatcher != nullptr);
-    d["scene_ptr_nonnull"]      = (g_scene      != nullptr);
-    d["material_ptr_nonnull"]   = (g_material   != nullptr);
-    d["opened"] = (g_foundation != nullptr);
-    d["state"]  = (g_foundation != nullptr) ? "opened" : "closed";
+    // Phase 5B status surface.
+    d["opened"]         = opened;
+    d["state"]          = opened ? "opened" : "closed";
+    d["step_count"]     = g_step_count;
+    d["last_dt"]        = g_last_dt;
+    d["gpu_enabled"]    = false;
+    d["has_foundation"] = has_foundation;
+    d["has_physics"]    = has_physics;
+    d["has_dispatcher"] = has_dispatcher;
+    d["has_scene"]      = has_scene;
+    d["has_material"]   = has_material;
+    d["message"]        = opened
+        ? "PhysX context open (empty scene; no rigid bodies)"
+        : "PhysX context closed";
+
+    // Phase 5A back-compat fields (kept so older probe scripts keep working).
+    d["foundation_ptr_nonnull"] = has_foundation;
+    d["physics_ptr_nonnull"]    = has_physics;
+    d["dispatcher_ptr_nonnull"] = has_dispatcher;
+    d["scene_ptr_nonnull"]      = has_scene;
+    d["material_ptr_nonnull"]   = has_material;
+    return d;
+}
+
+// Phase 5B: empty-Scene simulate(dt) + fetchResults(true). No rigid
+// bodies, no shapes, no collision, no Curves, no GPU. Just confirms
+// PhysX can advance the simulation pipeline by one frame.
+py::dict physx_probe_step(float dt)
+{
+    const bool is_open =
+        (g_foundation != nullptr) &&
+        (g_physics    != nullptr) &&
+        (g_scene      != nullptr);
+
+    py::dict d;
+    d["accepted"]              = false;
+    d["opened"]                = is_open;
+    d["dt"]                    = dt;
+    d["step_count_before"]     = g_step_count;
+    d["step_count_after"]      = g_step_count;
+    d["simulate_called"]       = false;
+    d["fetch_results_called"]  = false;
+
+    if (!is_open) {
+        d["message"] = "rejected: PhysX context not open (call physx_probe_open first)";
+        return d;
+    }
+    // dt > 0 also rejects NaN (NaN > 0 is false).
+    if (!(dt > 0.0f)) {
+        d["message"] = "rejected: dt must be > 0 (got non-positive or NaN)";
+        return d;
+    }
+
+    bool simulate_ok = false;
+    bool fetch_ok    = false;
+    std::string err_msg;
+
+    try {
+        g_scene->simulate(dt);
+        simulate_ok = true;
+        g_scene->fetchResults(/*block=*/true);
+        fetch_ok = true;
+    } catch (const std::exception& e) {
+        err_msg = std::string("std::exception during simulate/fetchResults: ") + e.what();
+    } catch (...) {
+        err_msg = "unknown C++ exception during simulate/fetchResults";
+    }
+
+    d["simulate_called"]      = simulate_ok;
+    d["fetch_results_called"] = fetch_ok;
+
+    if (simulate_ok && fetch_ok) {
+        g_step_count += 1ULL;
+        g_last_dt     = dt;
+        d["accepted"]         = true;
+        d["step_count_after"] = g_step_count;
+        d["last_dt"]          = g_last_dt;
+        d["message"]          = "simulate(dt) + fetchResults(true) succeeded on empty scene";
+    } else {
+        d["accepted"] = false;
+        d["step_count_after"] = g_step_count;
+        d["last_dt"]          = g_last_dt;
+        d["message"] = err_msg.empty()
+            ? std::string("simulate or fetchResults did not complete (no exception captured)")
+            : err_msg;
+    }
     return d;
 }
 
@@ -368,6 +462,8 @@ py::dict physx_probe_close()
         d["accepted"]        = true;
         d["already_closed"]  = true;
         d["opened"]          = false;
+        d["step_count"]      = g_step_count;
+        d["last_dt"]         = g_last_dt;
         d["message"]         = "PhysX context already closed";
         return d;
     }
@@ -394,9 +490,15 @@ py::dict physx_probe_close()
         g_foundation = nullptr;
     }
 
+    // Phase 5B: clear step probe state alongside lifecycle pointers.
+    g_step_count = 0ULL;
+    g_last_dt    = 0.0f;
+
     d["accepted"]        = true;
     d["already_closed"]  = false;
     d["opened"]          = false;
+    d["step_count"]      = g_step_count;
+    d["last_dt"]         = g_last_dt;
     d["message"]         = "PhysX context closed cleanly; all pointers nulled";
     return d;
 }
@@ -428,5 +530,7 @@ PYBIND11_MODULE(phase2b_probe, m) {
           py::arg("input_buf"));
     m.def("physx_probe_open",   &physx_probe_open);
     m.def("physx_probe_status", &physx_probe_status);
+    m.def("physx_probe_step",   &physx_probe_step,
+          py::arg("dt"));
     m.def("physx_probe_close",  &physx_probe_close);
 }
