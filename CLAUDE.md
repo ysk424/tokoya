@@ -79,6 +79,7 @@ expand scope or merge phases without explicit approval.**
 | **4E** | Time-driven non-cumulative C++ deformation across frames 800–840 via temporary `frame_change_post` handler. C++ replaces Phase 3E's pure Python loop: handler-internal cost **0.24 ms** (vs 12 ms in 3E, ~50× faster). 1-frame end-to-end stays at ~100 ms because Blender-side depsgraph/Surface Deform/rig dominates. Determinism, baseline restore, handler cleanup, Phase 1 invariants all verified | (MCP only) |
 | **5A** | PhysX 5.6.1 lifecycle probe: `physx_probe_open / status / close` in `native/probe.cpp`. CPU only (no GPU, no CUDA, no simulation, no rigid bodies). PhysX SDK cloned to **`C:\Users\azoo\git\PhysX`** (sibling dir, not in this repo), built with custom preset `vc17win64-cpu-md` (CPU only + dynamic CRT `/MD` to match pybind11). Open → status → close round-trips, idempotent re-open/re-close, Blender never crashes. First crash on 0.0.8 (`PhysX_64.dll` delay-loads `PhysXCommon_64.dll`, which `os.add_dll_directory` does NOT cover) → fixed in 0.0.9 by preloading the 3 PhysX DLLs in dependency order via `ctypes.WinDLL` inside `_native_loader.py` | this commit |
 | **5F** | MCP-only practical-scale verification of the Phase 5E pipeline against **CC_Base_Body** (225,184 verts / 397,024 loop triangles, Blender `Armature` modifier). Same Blender (x,y,z) → PhysX (x,z,-y) axis remap as 5E. Buffer build (matrix_world + remap + index extraction) via numpy fast path = **71.8 ms**. PhysX **CPU cooking = 130.1 ms** for 397k triangles. Per-step simulation = **0.081 ms/step** (dominated by BVH traversal). Sphere bounced at step 28 (meaningful interaction confirmed), then exited the body footprint as in 5E. Two cycles bit-deterministic. Blender did not crash. GPU/CUDA unused, Curves/SolverInterface untouched. **No code changes** | (MCP only — see Phase 5E commit `0ee4918`) |
+| **5G** | **GPU / CUDA PhysX lifecycle opened.** Custom preset `vc17win64-gpu-md` (CUDA 12.9, `/MD`, `PX_GENERATE_GPU_PROJECTS=True`, `PX_GENERATE_GPU_REDUCED_ARCHITECTURES=True` → SASS 80/86/89/90/100/120 + PTX 120, Blackwell SM_120 covered) built `PhysXGpu_64.dll` (324 MB). New entry points `physx_gpu_probe_open / status / step / close` in `native/probe.cpp` — **case A: completely separate GPU globals** from the CPU path, mutually exclusive open. `PxCreateCudaContextManager` succeeded, `cuda_device_name = "NVIDIA GeForce RTX 5070 Ti"`, `broadphase_type="GPU"`, `gpu_dynamics_enabled=true`, **`fallback_detected=false`**. Empty-scene `simulate/fetchResults` succeeded across 2 cycles. CPU path regression-free. Blender did not crash | this commit |
 
 **Phase 3 left no repo changes by design.** Phases 4D, 4D2, 4E left no
 repo changes either (MCP-only). The committed Phase 4 surface is
@@ -87,6 +88,72 @@ to the same file plus PhysX runtime DLL preloading in
 `_native_loader.py` and PhysX link settings in `native/setup.py`.
 Phase 5F left no repo changes either (MCP-only); it reuses the Phase 5E
 implementation against a production-scale Blender mesh.
+
+---
+
+## GPU PhysX env-var dev mode (Phase 5G) — load-bearing
+
+Phase 5G is the first phase that opens a GPU-enabled `PxScene` inside
+Blender. The integration intentionally stays in **dev-mode env-var
+discovery** — production bundling is deferred.
+
+* **PhysX SDK build**: custom preset `vc17win64-gpu-md` (in the sibling
+  PhysX source tree, **not** in this repo). Flags: `/MD` release CRT,
+  `PX_GENERATE_GPU_PROJECTS=True`, `PX_GENERATE_GPU_REDUCED_ARCHITECTURES=True`
+  (SASS 80/86/89/90/100/120 + PTX 120 — Blackwell SM_120 covered for the
+  RTX 5070 Ti). Stock `vc17win64.xml` is `/MT` debug CRT and incompatible
+  with the pybind11 module.
+* **CUDA toolchain**: CUDA Toolkit 12.9 with `nvcc.exe` on PATH. CUDA's
+  VS 2022 BuildTools MSBuild integration files (`CUDA 12.9.props`,
+  `.targets`, `.xml`, `Nvda.Build.CudaTasks.v12.9.dll`) must be copied
+  from `CUDA\v12.9\extras\visual_studio_integration\MSBuildExtensions\`
+  to `Microsoft Visual Studio\2022\BuildTools\MSBuild\Microsoft\VC\v170\BuildCustomizations\`
+  (one-time admin step; CUDA installer only does this automatically for
+  full VS, not BuildTools).
+* **Locale fix**: PhysX GPU build trips warning `C4819` in CUDA 12.9
+  `cuda.h(23862)` on Japanese-locale Windows (CP932). PhysX uses `/WX`,
+  so the benign C4819 becomes an error. Workaround: build with
+  `set CL=/wd4819 %CL%` (encoded in the sibling `physx/build_gpu_md.cmd`
+  wrapper). Does not affect codegen.
+* **Artifacts shipped with the GPU build** (~324 MB DLL because of
+  per-SM compiled CUDA kernels): `PhysXGpu_64.dll` plus the same
+  Foundation/Common/Cooking/PhysX_64 set as the CPU build. The GPU DLL
+  delay-loads only `nvcuda.dll` (NVIDIA driver, System32). No
+  `cudart64_*.dll` runtime is needed.
+* **Distribution strategy in Phase 5G**: **env-var only**. `native/`
+  holds all 5 PhysX DLLs (`*.dll` gitignored). The extension zip is
+  **not** rebuilt for 5G; `blender_manifest.toml` keeps its prior
+  version and `[build].paths` does **not** include `PhysXGpu_64.dll`.
+  The 324 MB DLL would inflate install/uninstall cycles for a
+  development probe. Production bundling is a later decision.
+* **Activation**: launch Blender from a PowerShell session that sets
+  `$env:HAIR_SIM_NATIVE_DIR = "C:\Users\azoo\git\blender-hair-extension\native"`.
+  The loader prefers that path over the bundled `<pkg>/native/`.
+* **Preload fix**: `PhysX_64.dll` resolves `PhysXGpu_64.dll` via a plain
+  `LoadLibrary("PhysXGpu_64.dll")` inside `PxCreateCudaContextManager`.
+  That call does not search `os.add_dll_directory` paths (same family
+  as the Phase 5A delay-load problem). `_native_loader.py` therefore
+  ctypes-preloads `PhysXGpu_64.dll` by absolute path; once loaded, the
+  process's DLL handle cache satisfies PhysX's later bare-name lookup.
+  Preload order: Foundation → Common → Cooking → PhysX_64 → **Gpu**.
+* **Lifecycle isolation (case A)**: GPU globals
+  (`g_gpu_foundation / g_gpu_physics / g_gpu_cuda_ctx / g_gpu_dispatcher
+  / g_gpu_scene`) are entirely separate from the CPU path. `physx_probe_open`
+  rejects when a GPU context exists, and vice versa. Do not share
+  `PxFoundation` / `PxPhysics` across the two paths in this phase.
+* **Verified result on RTX 5070 Ti + driver 596.36 + CUDA 12.9**:
+  `cuda_context_created=true`, `gpu_dynamics_enabled=true`,
+  `broadphase_type="GPU"`, `gpu_broadphase_enabled=true`,
+  **`fallback_detected=false`**, `cuda_device_name="NVIDIA GeForce RTX 5070 Ti"`.
+  Empty-scene `simulate/fetchResults` succeeds. Two open/step/close
+  cycles per session, CPU path regression-free.
+* **Bundled-extension drift**: during Phase 5G the `_native_loader.py`
+  inside the installed extension was hand-overwritten from this repo's
+  version so the preload list matches the GPU build. Re-installing the
+  existing v0.0.14 zip would revert that file and break GPU mode. The
+  next zip build (whenever Phase 5G is promoted from dev-mode) must
+  carry the updated loader. The committed repo `_native_loader.py` is
+  the source of truth.
 
 ---
 

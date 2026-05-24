@@ -6,14 +6,16 @@ from setuptools import setup
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 
 # PhysX 5 SDK is expected at ../../PhysX (sibling to this repo) — see
-# CLAUDE.md "External dependencies" section. The build preset that
-# produces these libs is vc17win64-cpu-md (CPU only, dynamic CRT to
-# match pybind11). Override via PHYSX_INSTALL_DIR if you put PhysX
-# somewhere else.
+# CLAUDE.md "External dependencies" section. Phase 5G adds the
+# vc17win64-gpu-md preset (CPU + GPU, dynamic CRT to match pybind11).
+# The GPU install is a superset of cpu-md for the CPU lib names that
+# Phase 5A-5F linked against, so switching the default here keeps all
+# earlier probes intact while making PhysXGpu_64 available for Phase 5G.
+# Override via PHYSX_INSTALL_DIR to point back at vc17win64-cpu-md.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_PHYSX_INSTALL = os.path.abspath(os.path.join(
     _HERE, "..", "..", "PhysX", "physx", "install",
-    "vc17win64-cpu-md", "PhysX"))
+    "vc17win64-gpu-md", "PhysX"))
 PHYSX_INSTALL = os.environ.get("PHYSX_INSTALL_DIR", _DEFAULT_PHYSX_INSTALL)
 
 PHYSX_INCLUDE = os.path.join(PHYSX_INSTALL, "include")

@@ -59,7 +59,16 @@ def _load_from_path(pyd_path: str) -> ModuleType | None:
         for dep_name in ("PhysXFoundation_64.dll",
                          "PhysXCommon_64.dll",
                          "PhysXCooking_64.dll",
-                         "PhysX_64.dll"):
+                         "PhysX_64.dll",
+                         # Phase 5G: PhysXGpu_64.dll is loaded at runtime by
+                         # PhysX_64 via plain LoadLibrary("PhysXGpu_64.dll")
+                         # inside PxCreateCudaContextManager. That call does
+                         # not search os.add_dll_directory paths, so without
+                         # an absolute-path ctypes preload here PhysX cannot
+                         # find PhysXGpu even when it sits next to PhysX_64.
+                         # In Phase 5G this file is dev-mode-deployed only;
+                         # PhysXGpu_64.dll is not in the extension zip.
+                         "PhysXGpu_64.dll"):
             dep_path = os.path.join(pyd_dir, dep_name)
             if os.path.isfile(dep_path):
                 try:

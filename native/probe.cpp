@@ -1,4 +1,4 @@
-// Phase 2B/4A/4B/4C/5A/5B/5C/5D/5E placeholder module. Module name,
+// Phase 2B/4A/4B/4C/5A/5B/5C/5D/5E/5G placeholder module. Module name,
 // function names, and phase attribute are experimental and will
 // change before any real solver wiring.
 //
@@ -29,10 +29,16 @@
 //                                  static collider + dynamic sphere; the
 //                                  Python side does the (x,z,-y) remap
 //                                  so C++ treats inputs as PhysX coords)
+//   5G: physx_gpu_probe_open/status/step/close
+//                                 (CUDA / GPU PhysX lifecycle probe; case
+//                                  A — completely separated globals from
+//                                  the CPU path; mutually exclusive open;
+//                                  empty scene only — no rigid bodies)
 #include <pybind11/pybind11.h>
 
 #include <PxPhysicsAPI.h>
 #include <cooking/PxCooking.h>
+#include <cudamanager/PxCudaContextManager.h>
 
 #include <chrono>
 #include <cstddef>
@@ -311,11 +317,52 @@ PxTriangleMesh*          g_triangle_mesh      = nullptr;
 PxRigidStatic*           g_blender_mesh_static   = nullptr;
 PxTriangleMesh*          g_blender_triangle_mesh = nullptr;
 
+// Phase 5G: GPU / CUDA lifecycle (case A — completely separate from CPU
+// globals above). CPU and GPU paths are mutually exclusive: if any CPU
+// global is non-null the GPU open is rejected and vice versa. PhysX itself
+// allows a single process to hold multiple PxFoundation objects, but to
+// keep the probe's diagnostic surface unambiguous we forbid coexistence
+// at the API level.
+PxFoundation*            g_gpu_foundation    = nullptr;
+PxPhysics*               g_gpu_physics       = nullptr;
+PxCudaContextManager*    g_gpu_cuda_ctx      = nullptr;
+PxDefaultCpuDispatcher*  g_gpu_dispatcher    = nullptr;
+PxScene*                 g_gpu_scene         = nullptr;
+unsigned long long       g_gpu_step_count    = 0ULL;
+float                    g_gpu_last_dt       = 0.0f;
+bool                     g_gpu_fallback_detected = false;
+std::string              g_gpu_cuda_error_message;
+int                      g_gpu_cuda_device_count = -1;
+std::string              g_gpu_cuda_device_name;
+PxBroadPhaseType::Enum   g_gpu_broadphase_actual = PxBroadPhaseType::eGPU;
+bool                     g_gpu_dynamics_actual   = false;
+
+const char* broadphase_type_name(PxBroadPhaseType::Enum t)
+{
+    switch (t) {
+        case PxBroadPhaseType::eSAP:  return "SAP";
+        case PxBroadPhaseType::eMBP:  return "MBP";
+        case PxBroadPhaseType::eABP:  return "ABP";
+        case PxBroadPhaseType::ePABP: return "PABP";
+        case PxBroadPhaseType::eGPU:  return "GPU";
+        default:                       return "Unknown";
+    }
+}
+
 }  // anonymous namespace
 
 py::dict physx_probe_open()
 {
     py::dict d;
+
+    // Phase 5G case A: forbid coexistence with GPU path.
+    if (g_gpu_foundation != nullptr) {
+        d["accepted"]       = false;
+        d["already_open"]   = false;
+        d["opened"]         = false;
+        d["message"]        = "rejected: GPU PhysX context is open; close it first (case A: CPU/GPU mutually exclusive)";
+        return d;
+    }
 
     if (g_foundation != nullptr) {
         d["accepted"]       = true;
@@ -1193,6 +1240,339 @@ py::dict physx_probe_close()
     return d;
 }
 
+// ---------------------------------------------------------------------- //
+// Phase 5G: GPU / CUDA PhysX lifecycle probe
+//
+// Mutually exclusive with the CPU probe path. Empty scene only — no rigid
+// bodies, no collision, no Curves. The only purpose is to confirm that
+// PxCreateCudaContextManager succeeds, that a GPU-enabled PxScene can be
+// created without silent CPU fallback, and that simulate(dt) /
+// fetchResults(true) round-trip safely on this RTX 5070 Ti + 596.36
+// driver + CUDA 12.9 + PhysX 5.6.1 stack.
+// ---------------------------------------------------------------------- //
+
+py::dict physx_gpu_probe_open()
+{
+    py::dict d;
+    d["gpu_requested"] = true;
+
+    // Case A: forbid coexistence with CPU path.
+    if (g_foundation != nullptr) {
+        d["accepted"]              = false;
+        d["opened"]                = false;
+        d["cuda_context_created"]  = false;
+        d["gpu_enabled"]           = false;
+        d["fallback_detected"]     = false;
+        d["message"]               = "rejected: CPU PhysX context is open; close it first (case A: CPU/GPU mutually exclusive)";
+        return d;
+    }
+
+    if (g_gpu_foundation != nullptr) {
+        // Already open — report current state without re-init.
+        const bool gpu_now = g_gpu_dynamics_actual && (g_gpu_broadphase_actual == PxBroadPhaseType::eGPU);
+        d["accepted"]              = true;
+        d["already_open"]          = true;
+        d["opened"]                = true;
+        d["cuda_context_created"]  = (g_gpu_cuda_ctx != nullptr);
+        d["gpu_enabled"]           = gpu_now;
+        d["gpu_dynamics_enabled"]  = g_gpu_dynamics_actual;
+        d["broadphase_type"]       = broadphase_type_name(g_gpu_broadphase_actual);
+        d["gpu_broadphase_enabled"]= (g_gpu_broadphase_actual == PxBroadPhaseType::eGPU);
+        d["fallback_detected"]     = g_gpu_fallback_detected;
+        d["cuda_device_count"]     = g_gpu_cuda_device_count;
+        d["cuda_device_name"]      = g_gpu_cuda_device_name;
+        d["message"]               = "GPU PhysX context already open";
+        return d;
+    }
+
+    // ---- Foundation ----
+    g_gpu_foundation = PxCreateFoundation(PX_PHYSICS_VERSION, g_allocator, g_error_callback);
+    if (g_gpu_foundation == nullptr) {
+        d["accepted"]              = false;
+        d["opened"]                = false;
+        d["cuda_context_created"]  = false;
+        d["gpu_enabled"]           = false;
+        d["fallback_detected"]     = false;
+        d["message"]               = "PxCreateFoundation failed";
+        return d;
+    }
+
+    // ---- CUDA context manager (safe-fail point) ----
+    g_gpu_cuda_error_message.clear();
+    g_gpu_cuda_device_name.clear();
+    g_gpu_cuda_device_count = -1;
+
+    PxCudaContextManagerDesc cudaDesc;
+    // Default fields create a new CUDA context on device 0.
+    g_gpu_cuda_ctx = PxCreateCudaContextManager(*g_gpu_foundation, cudaDesc);
+
+    const bool cuda_ok = (g_gpu_cuda_ctx != nullptr) && g_gpu_cuda_ctx->contextIsValid();
+    if (!cuda_ok) {
+        if (g_gpu_cuda_ctx != nullptr) {
+            g_gpu_cuda_ctx->release();
+            g_gpu_cuda_ctx = nullptr;
+        }
+        g_gpu_foundation->release();
+        g_gpu_foundation = nullptr;
+        g_gpu_fallback_detected = true;
+        g_gpu_cuda_error_message =
+            "PxCreateCudaContextManager returned null or invalid context "
+            "(likely missing PhysXGpu_64.dll, missing nvcuda.dll, or no compatible CUDA device).";
+
+        d["accepted"]              = false;
+        d["opened"]                = false;
+        d["cuda_context_created"]  = false;
+        d["gpu_enabled"]           = false;
+        d["gpu_dynamics_enabled"]  = false;
+        d["broadphase_type"]       = "n/a";
+        d["gpu_broadphase_enabled"]= false;
+        d["fallback_detected"]     = true;
+        d["cuda_error_message"]    = g_gpu_cuda_error_message;
+        d["message"]               = "GPU init failed safely; foundation released; CPU path remains intact";
+        return d;
+    }
+
+    // CUDA context succeeded — record device info.
+    const char* dev_name = g_gpu_cuda_ctx->getDeviceName();
+    g_gpu_cuda_device_name  = (dev_name != nullptr) ? dev_name : "(unknown)";
+    g_gpu_cuda_device_count = 1;  // PxCudaContextManager wraps a single device
+
+    // ---- Physics ----
+    g_gpu_physics = PxCreatePhysics(
+        PX_PHYSICS_VERSION,
+        *g_gpu_foundation,
+        PxTolerancesScale(),
+        false, nullptr);
+    if (g_gpu_physics == nullptr) {
+        g_gpu_cuda_ctx->release();   g_gpu_cuda_ctx   = nullptr;
+        g_gpu_foundation->release(); g_gpu_foundation = nullptr;
+        d["accepted"]              = false;
+        d["opened"]                = false;
+        d["cuda_context_created"]  = true;  // it did succeed
+        d["gpu_enabled"]           = false;
+        d["fallback_detected"]     = true;
+        d["message"]               = "PxCreatePhysics failed";
+        return d;
+    }
+
+    // ---- CPU dispatcher (GPU scene still needs one for CPU-side callbacks) ----
+    g_gpu_dispatcher = PxDefaultCpuDispatcherCreate(2);
+    if (g_gpu_dispatcher == nullptr) {
+        g_gpu_physics->release();    g_gpu_physics    = nullptr;
+        g_gpu_cuda_ctx->release();   g_gpu_cuda_ctx   = nullptr;
+        g_gpu_foundation->release(); g_gpu_foundation = nullptr;
+        d["accepted"]              = false;
+        d["opened"]                = false;
+        d["cuda_context_created"]  = true;
+        d["gpu_enabled"]           = false;
+        d["fallback_detected"]     = true;
+        d["message"]               = "PxDefaultCpuDispatcherCreate failed";
+        return d;
+    }
+
+    // ---- Scene with GPU dynamics + GPU broadphase ----
+    PxSceneDesc sceneDesc(g_gpu_physics->getTolerancesScale());
+    sceneDesc.gravity            = PxVec3(0.0f, -9.81f, 0.0f);
+    sceneDesc.cpuDispatcher      = g_gpu_dispatcher;
+    sceneDesc.filterShader       = PxDefaultSimulationFilterShader;
+    sceneDesc.cudaContextManager = g_gpu_cuda_ctx;
+    sceneDesc.flags             |= PxSceneFlag::eENABLE_GPU_DYNAMICS;
+    sceneDesc.broadPhaseType     = PxBroadPhaseType::eGPU;
+
+    g_gpu_scene = g_gpu_physics->createScene(sceneDesc);
+    if (g_gpu_scene == nullptr) {
+        g_gpu_dispatcher->release(); g_gpu_dispatcher = nullptr;
+        g_gpu_physics->release();    g_gpu_physics    = nullptr;
+        g_gpu_cuda_ctx->release();   g_gpu_cuda_ctx   = nullptr;
+        g_gpu_foundation->release(); g_gpu_foundation = nullptr;
+        d["accepted"]              = false;
+        d["opened"]                = false;
+        d["cuda_context_created"]  = true;
+        d["gpu_enabled"]           = false;
+        d["fallback_detected"]     = true;
+        d["message"]               = "createScene failed (GPU flags may not be supported on this driver)";
+        return d;
+    }
+
+    // Read back the actual flags from the scene PhysX kept.
+    const PxSceneFlags actualFlags = g_gpu_scene->getFlags();
+    g_gpu_dynamics_actual   = bool(actualFlags & PxSceneFlag::eENABLE_GPU_DYNAMICS);
+    g_gpu_broadphase_actual = g_gpu_scene->getBroadPhaseType();
+
+    const bool gpu_truly_enabled =
+        g_gpu_dynamics_actual && (g_gpu_broadphase_actual == PxBroadPhaseType::eGPU);
+    g_gpu_fallback_detected = !gpu_truly_enabled;
+
+    d["accepted"]              = true;
+    d["already_open"]          = false;
+    d["opened"]                = true;
+    d["cuda_context_created"]  = true;
+    d["gpu_enabled"]           = gpu_truly_enabled;
+    d["gpu_dynamics_enabled"]  = g_gpu_dynamics_actual;
+    d["broadphase_type"]       = broadphase_type_name(g_gpu_broadphase_actual);
+    d["gpu_broadphase_enabled"]= (g_gpu_broadphase_actual == PxBroadPhaseType::eGPU);
+    d["fallback_detected"]     = g_gpu_fallback_detected;
+    d["cuda_device_count"]     = g_gpu_cuda_device_count;
+    d["cuda_device_name"]      = g_gpu_cuda_device_name;
+    d["px_version_str"]        = std::string("major=") + std::to_string(PX_PHYSICS_VERSION_MAJOR)
+                               + " minor=" + std::to_string(PX_PHYSICS_VERSION_MINOR)
+                               + " bugfix=" + std::to_string(PX_PHYSICS_VERSION_BUGFIX);
+    d["message"]               = gpu_truly_enabled
+        ? "GPU PhysX scene up (eENABLE_GPU_DYNAMICS + eGPU broadphase confirmed via getFlags/getBroadPhaseType)"
+        : "GPU init succeeded but scene fell back to CPU on a flag (fallback_detected=true; do not treat as GPU success)";
+    return d;
+}
+
+py::dict physx_gpu_probe_status()
+{
+    py::dict d;
+    const bool opened = (g_gpu_foundation != nullptr);
+    const bool gpu_now = g_gpu_dynamics_actual && (g_gpu_broadphase_actual == PxBroadPhaseType::eGPU);
+
+    d["opened"]                = opened;
+    d["state"]                 = opened ? "opened" : "closed";
+    d["gpu_requested"]         = opened;  // we only ever request when opening
+    d["gpu_enabled"]           = opened && gpu_now;
+    d["cuda_context_created"]  = (g_gpu_cuda_ctx != nullptr);
+    d["gpu_dynamics_enabled"]  = g_gpu_dynamics_actual;
+    d["broadphase_type"]       = opened ? broadphase_type_name(g_gpu_broadphase_actual) : "n/a";
+    d["gpu_broadphase_enabled"]= opened && (g_gpu_broadphase_actual == PxBroadPhaseType::eGPU);
+    d["fallback_detected"]     = g_gpu_fallback_detected;
+    d["cuda_device_count"]     = g_gpu_cuda_device_count;
+    d["cuda_device_name"]      = g_gpu_cuda_device_name;
+    d["cuda_error_message"]    = g_gpu_cuda_error_message;
+    d["step_count"]            = g_gpu_step_count;
+    d["last_dt"]               = g_gpu_last_dt;
+    d["has_gpu_foundation"]    = (g_gpu_foundation != nullptr);
+    d["has_gpu_physics"]       = (g_gpu_physics    != nullptr);
+    d["has_gpu_dispatcher"]    = (g_gpu_dispatcher != nullptr);
+    d["has_gpu_scene"]         = (g_gpu_scene      != nullptr);
+    d["cpu_path_open"]         = (g_foundation     != nullptr);
+    d["message"]               = opened
+        ? (gpu_now ? "GPU PhysX context open and GPU-enabled"
+                   : "GPU PhysX context open but fallback_detected=true")
+        : "GPU PhysX context closed";
+    return d;
+}
+
+py::dict physx_gpu_probe_step(float dt)
+{
+    const bool is_open = (g_gpu_foundation != nullptr) && (g_gpu_scene != nullptr);
+
+    py::dict d;
+    d["accepted"]              = false;
+    d["opened"]                = is_open;
+    d["dt"]                    = dt;
+    d["step_count_before"]     = g_gpu_step_count;
+    d["step_count_after"]      = g_gpu_step_count;
+    d["simulate_called"]       = false;
+    d["fetch_results_called"]  = false;
+    d["gpu_enabled"]           = is_open && g_gpu_dynamics_actual
+                              && (g_gpu_broadphase_actual == PxBroadPhaseType::eGPU);
+
+    if (!is_open) {
+        d["message"] = "rejected: GPU PhysX context not open (call physx_gpu_probe_open first)";
+        return d;
+    }
+    if (!(dt > 0.0f)) {
+        d["message"] = "rejected: dt must be > 0 (got non-positive or NaN)";
+        return d;
+    }
+
+    bool simulate_ok = false;
+    bool fetch_ok    = false;
+    std::string err;
+    try {
+        g_gpu_scene->simulate(dt);
+        simulate_ok = true;
+        g_gpu_scene->fetchResults(/*block=*/true);
+        fetch_ok = true;
+    } catch (const std::exception& e) {
+        err = std::string("std::exception during simulate/fetchResults: ") + e.what();
+    } catch (...) {
+        err = "unknown C++ exception during simulate/fetchResults";
+    }
+
+    d["simulate_called"]       = simulate_ok;
+    d["fetch_results_called"]  = fetch_ok;
+
+    if (simulate_ok && fetch_ok) {
+        g_gpu_step_count += 1ULL;
+        g_gpu_last_dt     = dt;
+        d["accepted"]          = true;
+        d["step_count_after"]  = g_gpu_step_count;
+        d["last_dt"]           = g_gpu_last_dt;
+        d["message"]           = "GPU simulate(dt) + fetchResults(true) succeeded on empty GPU scene";
+    } else {
+        d["accepted"]          = false;
+        d["step_count_after"]  = g_gpu_step_count;
+        d["last_dt"]           = g_gpu_last_dt;
+        d["message"]           = err.empty()
+            ? std::string("GPU simulate or fetchResults did not complete (no exception)")
+            : err;
+    }
+    return d;
+}
+
+py::dict physx_gpu_probe_close()
+{
+    py::dict d;
+
+    if (g_gpu_foundation == nullptr) {
+        d["accepted"]              = true;
+        d["already_closed"]        = true;
+        d["opened"]                = false;
+        d["cuda_context_released"] = false;
+        d["step_count"]            = g_gpu_step_count;
+        d["last_dt"]               = g_gpu_last_dt;
+        d["message"]               = "GPU PhysX context already closed";
+        return d;
+    }
+
+    // Release in reverse order: scene -> dispatcher -> physics ->
+    // cuda context manager -> foundation.
+    if (g_gpu_scene != nullptr) {
+        g_gpu_scene->release();
+        g_gpu_scene = nullptr;
+    }
+    if (g_gpu_dispatcher != nullptr) {
+        g_gpu_dispatcher->release();
+        g_gpu_dispatcher = nullptr;
+    }
+    if (g_gpu_physics != nullptr) {
+        g_gpu_physics->release();
+        g_gpu_physics = nullptr;
+    }
+    bool cuda_released = false;
+    if (g_gpu_cuda_ctx != nullptr) {
+        g_gpu_cuda_ctx->release();
+        g_gpu_cuda_ctx = nullptr;
+        cuda_released = true;
+    }
+    if (g_gpu_foundation != nullptr) {
+        g_gpu_foundation->release();
+        g_gpu_foundation = nullptr;
+    }
+
+    g_gpu_step_count        = 0ULL;
+    g_gpu_last_dt           = 0.0f;
+    g_gpu_fallback_detected = false;
+    g_gpu_dynamics_actual   = false;
+    g_gpu_broadphase_actual = PxBroadPhaseType::eGPU;
+    g_gpu_cuda_device_count = -1;
+    g_gpu_cuda_device_name.clear();
+    g_gpu_cuda_error_message.clear();
+
+    d["accepted"]              = true;
+    d["already_closed"]        = false;
+    d["opened"]                = false;
+    d["cuda_context_released"] = cuda_released;
+    d["step_count"]            = g_gpu_step_count;
+    d["last_dt"]               = g_gpu_last_dt;
+    d["message"]               = "GPU PhysX context closed cleanly; CUDA/physics/scene/dispatcher/foundation released";
+    return d;
+}
+
 PYBIND11_MODULE(phase2b_probe, m) {
     m.attr("phase") = "2B";
     m.def("add", &add);
@@ -1240,4 +1620,11 @@ PYBIND11_MODULE(phase2b_probe, m) {
     m.def("physx_probe_step",                &physx_probe_step,
           py::arg("dt"));
     m.def("physx_probe_close",               &physx_probe_close);
+
+    // Phase 5G: GPU / CUDA lifecycle (case A — independent from CPU path).
+    m.def("physx_gpu_probe_open",   &physx_gpu_probe_open);
+    m.def("physx_gpu_probe_status", &physx_gpu_probe_status);
+    m.def("physx_gpu_probe_step",   &physx_gpu_probe_step,
+          py::arg("dt"));
+    m.def("physx_gpu_probe_close",  &physx_gpu_probe_close);
 }
