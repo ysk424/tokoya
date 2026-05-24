@@ -1,11 +1,18 @@
-// Phase 2B/4A/4B placeholder. Module name, function names, and phase
-// attribute are experimental and will change before any real solver
-// wiring. Phase 4A added describe_curves; Phase 4B added
-// probe_position_buffer (read-only buffer round-trip).
+// Phase 2B/4A/4B/4C placeholder. Module name, function names, and
+// phase attribute are experimental and will change before any real
+// solver wiring.
+//
+// Phase history of this file:
+//   4A: describe_curves           (metadata round-trip only)
+//   4B: probe_position_buffer     (read-only float32 buffer ingest)
+//   4C: deform_position_buffer    (read input, allocate new result
+//                                  buffer, write deterministic
+//                                  deformation, return as py::bytes)
 #include <pybind11/pybind11.h>
 
 #include <cstddef>
 #include <string>
+#include <vector>
 
 namespace py = pybind11;
 
@@ -57,12 +64,6 @@ py::dict describe_curves(
     return d;
 }
 
-// Phase 4B: accept one frame's float32 position buffer (read-only via
-// the Python buffer protocol), validate its shape against expected
-// metadata, compute simple statistics, and return them.
-//
-// Buffer pointer is NOT retained — only used inside this function.
-// Buffer contents are NOT modified — read-only via const float*.
 py::dict probe_position_buffer(
     unsigned int expected_point_count,
     unsigned int expected_float_count,
@@ -102,8 +103,6 @@ py::dict probe_position_buffer(
     const std::size_t n_floats = static_cast<std::size_t>(info.size);
     const std::size_t n_points = n_floats / 3u;
 
-    // Initialize min/max from the first point so we don't depend on
-    // an artificial sentinel value.
     double min_x = p[0], min_y = p[1], min_z = p[2];
     double max_x = p[0], max_y = p[1], max_z = p[2];
     double sum_x = 0.0, sum_y = 0.0, sum_z = 0.0;
@@ -146,8 +145,125 @@ py::dict probe_position_buffer(
     d["message"]     = "buffer accepted and read; pointer not retained";
 
     return d;
-    // 'p' and 'info' go out of scope here — no pointer or reference
-    // is preserved beyond this function call.
+}
+
+// Phase 4C: read input float32 buffer, write deterministic deformation
+// into a freshly allocated result buffer, and return that buffer as
+// py::bytes alongside summary fields.
+//
+// Deformation (placeholder, simple and reversible):
+//   per-strand: root has 0 z-offset, tip has +amplitude z-offset,
+//   intermediate points linearly interpolated. x and y are copied
+//   verbatim from the input.
+//
+// Constraints honored:
+//   * input_buf is requested non-writable; only const float* is used.
+//   * No raw input pointer is stored beyond the function body.
+//   * Result memory is owned by Python via py::bytes (lifetime is
+//     the returned object).
+//   * points_per_strand is supplied by the caller — the C++ side does
+//     not assume 8 globally; it just uses what the caller passes.
+py::dict deform_position_buffer(
+    unsigned int expected_point_count,
+    unsigned int expected_float_count,
+    unsigned int points_per_strand,
+    int          frame_current,
+    float        amplitude,
+    py::buffer   input_buf)
+{
+    py::buffer_info info = input_buf.request(/*writable=*/false);
+
+    const bool itemsize_ok = (info.itemsize == static_cast<py::ssize_t>(sizeof(float)));
+    const bool format_ok   = (info.format == py::format_descriptor<float>::format());
+    const bool size_ok     = (info.size == static_cast<py::ssize_t>(expected_float_count));
+    const bool count_consistent =
+        (expected_float_count == expected_point_count * 3u);
+    const bool pps_ok =
+        (points_per_strand >= 2u) &&
+        (expected_point_count % points_per_strand == 0u);
+
+    const bool accepted = itemsize_ok && format_ok && size_ok
+                       && count_consistent && pps_ok;
+
+    py::dict d;
+    d["accepted"]          = accepted;
+    d["amplitude"]         = amplitude;
+    d["points_per_strand"] = points_per_strand;
+    d["frame_current"]     = frame_current;
+    d["float_count"]       = info.size;
+    d["point_count"]       = info.size / 3;
+    d["itemsize_ok"]       = itemsize_ok;
+    d["format_ok"]         = format_ok;
+    d["size_ok"]           = size_ok;
+    d["consistent"]        = count_consistent;
+    d["pps_ok"]            = pps_ok;
+
+    if (!accepted) {
+        d["message"] = "input validation failed (itemsize/format/size/consistency/pps)";
+        return d;
+    }
+
+    const float* in_p = static_cast<const float*>(info.ptr);
+    const std::size_t n_floats = static_cast<std::size_t>(info.size);
+    const std::size_t n_points = n_floats / 3u;
+    const std::size_t pps      = static_cast<std::size_t>(points_per_strand);
+    const float       inv_max  = 1.0f / static_cast<float>(pps - 1u);
+    const std::size_t tip_idx  = pps - 1u;  // tip is the last point in each strand
+
+    // Snapshot first/tip BEFORE we read more, just to keep the
+    // diagnostics readable.
+    const double f0_in[3]  = { in_p[0], in_p[1], in_p[2] };
+    const double tip_in[3] = { in_p[tip_idx * 3u + 0],
+                               in_p[tip_idx * 3u + 1],
+                               in_p[tip_idx * 3u + 2] };
+
+    // Allocate result memory (will be moved into py::bytes below).
+    std::vector<char> result_bytes(n_floats * sizeof(float));
+    float* out_p = reinterpret_cast<float*>(result_bytes.data());
+
+    double cs_before = 0.0;
+    double cs_after  = 0.0;
+
+    for (std::size_t i = 0; i < n_points; ++i) {
+        const std::size_t pps_idx = i % pps;
+        const float factor = static_cast<float>(pps_idx) * inv_max;
+        const float dz     = factor * amplitude;
+
+        const float x = in_p[i * 3u + 0];
+        const float y = in_p[i * 3u + 1];
+        const float z = in_p[i * 3u + 2];
+
+        out_p[i * 3u + 0] = x;
+        out_p[i * 3u + 1] = y;
+        out_p[i * 3u + 2] = z + dz;
+
+        cs_before += static_cast<double>(x) + static_cast<double>(y) + static_cast<double>(z);
+        cs_after  += static_cast<double>(out_p[i * 3u + 0])
+                  +  static_cast<double>(out_p[i * 3u + 1])
+                  +  static_cast<double>(out_p[i * 3u + 2]);
+    }
+
+    const double f0_out[3]  = { out_p[0], out_p[1], out_p[2] };
+    const double tip_out[3] = { out_p[tip_idx * 3u + 0],
+                                out_p[tip_idx * 3u + 1],
+                                out_p[tip_idx * 3u + 2] };
+
+    d["first_vec3_before"] = py::make_tuple(f0_in[0],  f0_in[1],  f0_in[2]);
+    d["first_vec3_after"]  = py::make_tuple(f0_out[0], f0_out[1], f0_out[2]);
+    d["tip_vec3_before"]   = py::make_tuple(tip_in[0], tip_in[1], tip_in[2]);
+    d["tip_vec3_after"]    = py::make_tuple(tip_out[0], tip_out[1], tip_out[2]);
+    d["checksum_before"]   = cs_before;
+    d["checksum_after"]    = cs_after;
+    d["checksum_delta"]    = cs_after - cs_before;
+    d["message"]           = "deformation applied to new result buffer; input untouched";
+
+    // Move the bytes into a Python-owned py::bytes object. The C++
+    // std::vector goes out of scope at function return; py::bytes
+    // holds an independent copy whose lifetime is managed by Python.
+    d["result_buffer"] = py::bytes(result_bytes.data(),
+                                   static_cast<py::ssize_t>(result_bytes.size()));
+
+    return d;
 }
 
 PYBIND11_MODULE(phase2b_probe, m) {
@@ -168,4 +284,11 @@ PYBIND11_MODULE(phase2b_probe, m) {
           py::arg("expected_float_count"),
           py::arg("frame_current"),
           py::arg("buf"));
+    m.def("deform_position_buffer", &deform_position_buffer,
+          py::arg("expected_point_count"),
+          py::arg("expected_float_count"),
+          py::arg("points_per_strand"),
+          py::arg("frame_current"),
+          py::arg("amplitude"),
+          py::arg("input_buf"));
 }
