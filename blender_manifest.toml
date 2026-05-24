@@ -12,3 +12,9 @@ blender_version_min = "5.1.0"
 license = ["SPDX:Apache-2.0"]
 
 tags = ["Physics"]
+
+[build]
+paths = [
+    "__init__.py",
+    "ui.py",
+]
