@@ -35,6 +35,37 @@ def _find_pyd(native_dir: str) -> str | None:
 
 
 def _load_from_path(pyd_path: str) -> ModuleType | None:
+    # Make co-located runtime DLLs (Phase 5A: PhysX) resolvable.
+    pyd_dir = os.path.dirname(pyd_path)
+
+    # 1) Tell Python's extension import machinery about the directory.
+    #    This handles statically linked deps of the .pyd itself.
+    if hasattr(os, "add_dll_directory") and os.path.isdir(pyd_dir):
+        try:
+            os.add_dll_directory(pyd_dir)
+        except (OSError, FileNotFoundError):
+            pass
+
+    # 2) Preload PhysX runtime DLLs in dependency order. PhysX_64 uses
+    #    delay-load for PhysXCommon_64, and the Microsoft delay-load
+    #    helper does raw LoadLibrary calls that do NOT respect
+    #    os.add_dll_directory (per Python docs). Loading the DLLs here
+    #    by absolute path puts them in the process's DLL handle cache
+    #    so delay-load resolves them by bare filename later.
+    #    These DLLs may not be present (e.g., extension built without
+    #    PhysX); each load is best-effort and does not abort import.
+    if os.path.isdir(pyd_dir):
+        import ctypes
+        for dep_name in ("PhysXFoundation_64.dll",
+                         "PhysXCommon_64.dll",
+                         "PhysX_64.dll"):
+            dep_path = os.path.join(pyd_dir, dep_name)
+            if os.path.isfile(dep_path):
+                try:
+                    ctypes.WinDLL(dep_path)
+                except OSError:
+                    pass
+
     sys.modules.pop(_MODULE_NAME, None)
     spec = importlib.util.spec_from_file_location(_MODULE_NAME, pyd_path)
     if spec is None or spec.loader is None:

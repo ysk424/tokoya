@@ -1,20 +1,26 @@
-// Phase 2B/4A/4B/4C placeholder. Module name, function names, and
-// phase attribute are experimental and will change before any real
+// Phase 2B/4A/4B/4C/5A placeholder module. Module name, function names,
+// and phase attribute are experimental and will change before any real
 // solver wiring.
 //
 // Phase history of this file:
 //   4A: describe_curves           (metadata round-trip only)
 //   4B: probe_position_buffer     (read-only float32 buffer ingest)
-//   4C: deform_position_buffer    (read input, allocate new result
-//                                  buffer, write deterministic
-//                                  deformation, return as py::bytes)
+//   4C: deform_position_buffer    (C++ allocates new result, writes
+//                                  deterministic deformation, returns
+//                                  as py::bytes)
+//   5A: physx_probe_open/status/close   (PhysX 5 CPU-only lifecycle;
+//                                        no simulation, no rigid bodies,
+//                                        no collision, no GPU)
 #include <pybind11/pybind11.h>
+
+#include <PxPhysicsAPI.h>
 
 #include <cstddef>
 #include <string>
 #include <vector>
 
 namespace py = pybind11;
+using namespace physx;
 
 int add(int a, int b) { return a + b; }
 
@@ -147,22 +153,6 @@ py::dict probe_position_buffer(
     return d;
 }
 
-// Phase 4C: read input float32 buffer, write deterministic deformation
-// into a freshly allocated result buffer, and return that buffer as
-// py::bytes alongside summary fields.
-//
-// Deformation (placeholder, simple and reversible):
-//   per-strand: root has 0 z-offset, tip has +amplitude z-offset,
-//   intermediate points linearly interpolated. x and y are copied
-//   verbatim from the input.
-//
-// Constraints honored:
-//   * input_buf is requested non-writable; only const float* is used.
-//   * No raw input pointer is stored beyond the function body.
-//   * Result memory is owned by Python via py::bytes (lifetime is
-//     the returned object).
-//   * points_per_strand is supplied by the caller — the C++ side does
-//     not assume 8 globally; it just uses what the caller passes.
 py::dict deform_position_buffer(
     unsigned int expected_point_count,
     unsigned int expected_float_count,
@@ -208,16 +198,13 @@ py::dict deform_position_buffer(
     const std::size_t n_points = n_floats / 3u;
     const std::size_t pps      = static_cast<std::size_t>(points_per_strand);
     const float       inv_max  = 1.0f / static_cast<float>(pps - 1u);
-    const std::size_t tip_idx  = pps - 1u;  // tip is the last point in each strand
+    const std::size_t tip_idx  = pps - 1u;
 
-    // Snapshot first/tip BEFORE we read more, just to keep the
-    // diagnostics readable.
     const double f0_in[3]  = { in_p[0], in_p[1], in_p[2] };
     const double tip_in[3] = { in_p[tip_idx * 3u + 0],
                                in_p[tip_idx * 3u + 1],
                                in_p[tip_idx * 3u + 2] };
 
-    // Allocate result memory (will be moved into py::bytes below).
     std::vector<char> result_bytes(n_floats * sizeof(float));
     float* out_p = reinterpret_cast<float*>(result_bytes.data());
 
@@ -257,12 +244,160 @@ py::dict deform_position_buffer(
     d["checksum_delta"]    = cs_after - cs_before;
     d["message"]           = "deformation applied to new result buffer; input untouched";
 
-    // Move the bytes into a Python-owned py::bytes object. The C++
-    // std::vector goes out of scope at function return; py::bytes
-    // holds an independent copy whose lifetime is managed by Python.
     d["result_buffer"] = py::bytes(result_bytes.data(),
                                    static_cast<py::ssize_t>(result_bytes.size()));
 
+    return d;
+}
+
+// ---------------------------------------------------------------------- //
+// Phase 5A: PhysX lifecycle probe
+//
+// CPU only. No GPU dispatcher, no CUDA context, no simulation step, no
+// rigid actors, no collision data, no Curves access. The PhysX state is
+// confined to this translation unit and exists only through the three
+// functions below.
+// ---------------------------------------------------------------------- //
+
+namespace {
+
+PxDefaultAllocator       g_allocator;
+PxDefaultErrorCallback   g_error_callback;
+
+PxFoundation*            g_foundation  = nullptr;
+PxPhysics*               g_physics     = nullptr;
+PxDefaultCpuDispatcher*  g_dispatcher  = nullptr;
+PxScene*                 g_scene       = nullptr;
+PxMaterial*              g_material    = nullptr;
+
+}  // anonymous namespace
+
+py::dict physx_probe_open()
+{
+    py::dict d;
+
+    if (g_foundation != nullptr) {
+        d["accepted"]       = true;
+        d["already_open"]   = true;
+        d["opened"]         = true;
+        d["message"]        = "PhysX context already open";
+        return d;
+    }
+
+    g_foundation = PxCreateFoundation(PX_PHYSICS_VERSION, g_allocator, g_error_callback);
+    if (g_foundation == nullptr) {
+        d["accepted"] = false;
+        d["opened"]   = false;
+        d["message"]  = "PxCreateFoundation failed";
+        return d;
+    }
+
+    g_physics = PxCreatePhysics(
+        PX_PHYSICS_VERSION,
+        *g_foundation,
+        PxTolerancesScale(),
+        /*trackOutstandingAllocations*/ false,
+        /*pvd*/ nullptr);
+    if (g_physics == nullptr) {
+        g_foundation->release();
+        g_foundation = nullptr;
+        d["accepted"] = false;
+        d["opened"]   = false;
+        d["message"]  = "PxCreatePhysics failed";
+        return d;
+    }
+
+    g_dispatcher = PxDefaultCpuDispatcherCreate(/*numThreads*/ 2);
+    if (g_dispatcher == nullptr) {
+        g_physics->release();    g_physics = nullptr;
+        g_foundation->release(); g_foundation = nullptr;
+        d["accepted"] = false;
+        d["opened"]   = false;
+        d["message"]  = "PxDefaultCpuDispatcherCreate failed";
+        return d;
+    }
+
+    PxSceneDesc scene_desc(g_physics->getTolerancesScale());
+    scene_desc.gravity        = PxVec3(0.0f, -9.81f, 0.0f);
+    scene_desc.cpuDispatcher  = g_dispatcher;
+    scene_desc.filterShader   = PxDefaultSimulationFilterShader;
+    g_scene = g_physics->createScene(scene_desc);
+    if (g_scene == nullptr) {
+        g_dispatcher->release(); g_dispatcher = nullptr;
+        g_physics->release();    g_physics    = nullptr;
+        g_foundation->release(); g_foundation = nullptr;
+        d["accepted"] = false;
+        d["opened"]   = false;
+        d["message"]  = "createScene failed";
+        return d;
+    }
+
+    g_material = g_physics->createMaterial(0.5f, 0.5f, 0.6f);
+    // material is optional for open/close probe; ignore if it fails
+
+    d["accepted"]      = true;
+    d["already_open"]  = false;
+    d["opened"]        = true;
+    d["px_version"]    = static_cast<unsigned int>(PX_PHYSICS_VERSION);
+    d["px_version_str"] = std::string("major=") + std::to_string(PX_PHYSICS_VERSION_MAJOR)
+                        + " minor=" + std::to_string(PX_PHYSICS_VERSION_MINOR)
+                        + " bugfix=" + std::to_string(PX_PHYSICS_VERSION_BUGFIX);
+    d["gpu_enabled"]   = false;
+    d["message"]       = "PhysX context opened (CPU only, no simulation, no rigid bodies)";
+    return d;
+}
+
+py::dict physx_probe_status()
+{
+    py::dict d;
+    d["foundation_ptr_nonnull"] = (g_foundation != nullptr);
+    d["physics_ptr_nonnull"]    = (g_physics    != nullptr);
+    d["dispatcher_ptr_nonnull"] = (g_dispatcher != nullptr);
+    d["scene_ptr_nonnull"]      = (g_scene      != nullptr);
+    d["material_ptr_nonnull"]   = (g_material   != nullptr);
+    d["opened"] = (g_foundation != nullptr);
+    d["state"]  = (g_foundation != nullptr) ? "opened" : "closed";
+    return d;
+}
+
+py::dict physx_probe_close()
+{
+    py::dict d;
+
+    if (g_foundation == nullptr) {
+        d["accepted"]        = true;
+        d["already_closed"]  = true;
+        d["opened"]          = false;
+        d["message"]         = "PhysX context already closed";
+        return d;
+    }
+
+    // Release in reverse order of dependency.
+    if (g_material != nullptr) {
+        g_material->release();
+        g_material = nullptr;
+    }
+    if (g_scene != nullptr) {
+        g_scene->release();
+        g_scene = nullptr;
+    }
+    if (g_dispatcher != nullptr) {
+        g_dispatcher->release();
+        g_dispatcher = nullptr;
+    }
+    if (g_physics != nullptr) {
+        g_physics->release();
+        g_physics = nullptr;
+    }
+    if (g_foundation != nullptr) {
+        g_foundation->release();
+        g_foundation = nullptr;
+    }
+
+    d["accepted"]        = true;
+    d["already_closed"]  = false;
+    d["opened"]          = false;
+    d["message"]         = "PhysX context closed cleanly; all pointers nulled";
     return d;
 }
 
@@ -291,4 +426,7 @@ PYBIND11_MODULE(phase2b_probe, m) {
           py::arg("frame_current"),
           py::arg("amplitude"),
           py::arg("input_buf"));
+    m.def("physx_probe_open",   &physx_probe_open);
+    m.def("physx_probe_status", &physx_probe_status);
+    m.def("physx_probe_close",  &physx_probe_close);
 }

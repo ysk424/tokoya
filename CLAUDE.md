@@ -77,10 +77,63 @@ expand scope or merge phases without explicit approval.**
 | **4D** | First end-to-end round-trip Blender↔C++↔Blender attempted with **evaluated→original** writeback. **Mechanically passed all API checks** but caused a double Surface Deform application — hair detached from head (`eval_first` shifted from -0.319 to -0.620). Documented as the textbook landmine #2 outcome; path **rejected as the canonical route** | (MCP only) |
 | **4D2** | Canonical round-trip: **original→C++→original**. Hair deforms naturally and stays attached to the head. Root completely fixed (eval delta = (0,0,0)), tip lifts (eval z delta +0.236 from input +0.25). Surface Deform applies its transform once on the modified rest pose | (MCP only) |
 | **4E** | Time-driven non-cumulative C++ deformation across frames 800–840 via temporary `frame_change_post` handler. C++ replaces Phase 3E's pure Python loop: handler-internal cost **0.24 ms** (vs 12 ms in 3E, ~50× faster). 1-frame end-to-end stays at ~100 ms because Blender-side depsgraph/Surface Deform/rig dominates. Determinism, baseline restore, handler cleanup, Phase 1 invariants all verified | (MCP only) |
+| **5A** | PhysX 5.6.1 lifecycle probe: `physx_probe_open / status / close` in `native/probe.cpp`. CPU only (no GPU, no CUDA, no simulation, no rigid bodies). PhysX SDK cloned to **`C:\Users\azoo\git\PhysX`** (sibling dir, not in this repo), built with custom preset `vc17win64-cpu-md` (CPU only + dynamic CRT `/MD` to match pybind11). Open → status → close round-trips, idempotent re-open/re-close, Blender never crashes. First crash on 0.0.8 (`PhysX_64.dll` delay-loads `PhysXCommon_64.dll`, which `os.add_dll_directory` does NOT cover) → fixed in 0.0.9 by preloading the 3 PhysX DLLs in dependency order via `ctypes.WinDLL` inside `_native_loader.py` | this commit |
 
 **Phase 3 left no repo changes by design.** Phases 4D, 4D2, 4E left no
 repo changes either (MCP-only). The committed Phase 4 surface is
-`4A` + `4B` + `4C` in `native/probe.cpp`.
+`4A` + `4B` + `4C` in `native/probe.cpp`. Phase 5A adds open/status/close
+to the same file plus PhysX runtime DLL preloading in
+`_native_loader.py` and PhysX link settings in `native/setup.py`.
+
+---
+
+## External PhysX SDK location (Phase 5A onward)
+
+PhysX 5 is **not** vendored in this repo. It lives outside:
+
+```
+C:\Users\azoo\git\PhysX                  ← shallow clone of NVIDIA-Omniverse/PhysX (5.6.1)
+└── physx\
+    ├── include\                          # source headers (unused; we use install/)
+    ├── source\, compiler\, ...           # SDK sources + generated VS projects
+    ├── buildtools\presets\public\
+    │   └── vc17win64-cpu-md.xml         # custom preset (CPU only + /MD CRT)
+    └── install\vc17win64-cpu-md\PhysX\   # build output, consumed by setup.py
+        ├── include\                      # public headers
+        └── bin\win.x86_64.vc143.md\release\
+            ├── PhysXFoundation_64.{lib,dll}
+            ├── PhysXCommon_64.{lib,dll}
+            ├── PhysX_64.{lib,dll}
+            └── PhysXExtensions_static_64.lib, PhysXPvdSDK_static_64.lib (link only)
+```
+
+**Why a custom preset:** the stock `vc17win64-cpu-only.xml` preset
+builds with `/MT` (static CRT) which is ABI-incompatible with the
+pybind11 module (built `/MD`). The custom `vc17win64-cpu-md.xml`
+preset flips `NV_USE_STATIC_WINCRT=False` and also disables snippets
+and OmniPVD to keep the build minimum.
+
+**To rebuild PhysX from scratch:**
+1. `cd C:\Users\azoo\git\PhysX\physx`
+2. `generate_projects.bat vc17win64-cpu-md` (needs VS cmake on PATH)
+3. Open `compiler\vc17win64-cpu-md\PhysXSDK.sln` in MSBuild (or VS),
+   build the `INSTALL` project, configuration `release`, platform `x64`.
+4. Re-run `native/build.cmd` to re-link `phase2b_probe.pyd` against the
+   updated PhysX libs.
+5. Re-copy `PhysX_64.dll`, `PhysXCommon_64.dll`, `PhysXFoundation_64.dll`
+   into `native/` (they are `.gitignore`d).
+
+**Override the PhysX install path** by setting `PHYSX_INSTALL_DIR`
+before running `native/build.cmd`. Default is the sibling path above.
+
+**Delay-load caveat:** `PhysX_64.dll` declares `PhysXCommon_64.dll` as
+a *delay-loaded* dependency. The Microsoft delay-load helper uses raw
+`LoadLibrary` calls that do NOT respect `os.add_dll_directory`. The
+loader (`_native_loader.py`) therefore explicitly preloads PhysX DLLs
+in dependency order (Foundation → Common → PhysX) via `ctypes.WinDLL`
+with absolute paths before importing the extension module. Without
+that preload, `PxCreatePhysics` crashes with VC EH delay-load failure
+`0xc06d007e`.
 
 ---
 

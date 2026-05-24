@@ -20,6 +20,9 @@ dist/
 *.lib
 *.exp
 
+# PhysX runtime DLLs (copied next to .pyd at build time, NOT tracked)
+*.dll
+
 # IDE
 .vscode/
 .idea/
