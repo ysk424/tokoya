@@ -319,7 +319,9 @@ them.
 
 ## Branches
 
-* `main` — current line of work, HEAD `4c7e0ec` (Phase 2D).
+* `main` — current line of work, HEAD `9f0b8e5` (Phase 5A: PhysX
+  5.6.1 open/close probe). Run `git log --oneline -10` for the real
+  current state — this comment can lag.
 * `phase2-cpp` — quarantined early scaffolding (full C++/PhysX/CMake/
   scikit-build-core/scripts/extern submodule) that was stripped from
   main when Phase 1 was reset. Reference only — do not cherry-pick
@@ -337,6 +339,9 @@ arrives.
   iteration.
 * `feedback_curves_landmines.md` — the 10 Curves rules above (longer
   version with reasons).
+* `feedback_performance_stance.md` — Phase 4E conclusion: extension
+  code path is sub-ms; Surface Deform / rig cost (~100 ms/frame) is
+  the scene's, not the extension's, and is out of scope.
 
 ---
 
@@ -345,19 +350,31 @@ arrives.
 These are *candidates*. None are committed to. Each needs its own
 design pass + user GO before implementation:
 
-* **Phase 5 (?)** — SolverInterface wiring: replace the Python stub
-  body of `start / stop / reset / step` with calls into the
-  Phase 4D2 canonical round-trip. Still no PhysX; the C++ side is
-  the Phase 4C deterministic deformation. Mind landmine #7
-  (permanent `frame_change_post` wiring is a separate risk class).
-* **Phase 6 (?)** — replace the placeholder deformation with a real
-  (still simple) physics-ish update in C++: gravity, inertia, fixed
-  root constraint. Per-Object solver state. Still no PhysX SDK.
+* **Phase 5B (?)** — first PhysX simulation step. Inside the C++
+  side already opened in 5A: add a placeholder rigid body or two,
+  call `PxScene::simulate(dt)` + `fetchResults()`, read back a
+  position, release. Still no Curves, still CPU only, still no GPU,
+  no Blender-side wiring. Confirms the simulator runs without
+  destabilizing the lifecycle established in 5A.
+* **Phase 5C (?)** — SolverInterface wiring: replace the Python
+  stub body of `start / stop / reset / step` so that pressing
+  Start/Stop drives the PhysX context open/close, and `step` runs
+  a single PhysX `simulate(dt)`. Still no Curves data exchange.
+  Mind landmine #7 (permanent `frame_change_post` wiring is a
+  separate risk class — gate behind `hair_sim_running` exactly like
+  Phase 1's stub already does).
+* **Phase 6 (?)** — first contact between Phase 4D2's Curves
+  round-trip and Phase 5C's PhysX scene: spawn one rigid body per
+  strand point (or one per strand), simulate, write transformed
+  positions back through the canonical original→C++→original path.
+  Mind landmine #2 (original-space != evaluated-space).
 * **Phase 7 (?)** — Curves bake path: investigate consuming a baked
   dataset so Surface Deform can be bypassed when desired. Out of
   scope for normal operation.
-* **Phase 8+ (?)** — PhysX SDK, CUDA, GPU integration. Far away.
-  Quarantined `phase2-cpp` branch has reference material.
+* **Phase 8+ (?)** — PhysX GPU / CUDA. Far away. Requires re-enabling
+  the GPU build options in the PhysX preset, redistributing CUDA
+  runtime DLLs, and accepting all the risks the current sibling-dir
+  CPU-only build deliberately avoided.
 
 When a new phase begins, do not skip steps:
 1. Wait for a design request from the user.
