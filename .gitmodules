@@ -1,0 +1,3 @@
+[submodule "extern/PhysX"]
+	path = extern/PhysX
+	url = https://github.com/NVIDIA-Omniverse/PhysX.git
