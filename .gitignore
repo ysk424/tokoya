@@ -10,6 +10,15 @@ __pycache__/
 build/
 dist/
 *.zip
+*.egg-info/
+
+# Native build artifacts
+*.pyd
+*.so
+*.dylib
+*.obj
+*.lib
+*.exp
 
 # IDE
 .vscode/
