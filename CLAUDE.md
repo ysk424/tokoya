@@ -80,7 +80,9 @@ expand scope or merge phases without explicit approval.**
 | **5A** | PhysX 5.6.1 lifecycle probe: `physx_probe_open / status / close` in `native/probe.cpp`. CPU only (no GPU, no CUDA, no simulation, no rigid bodies). PhysX SDK cloned to **`C:\Users\azoo\git\PhysX`** (sibling dir, not in this repo), built with custom preset `vc17win64-cpu-md` (CPU only + dynamic CRT `/MD` to match pybind11). Open → status → close round-trips, idempotent re-open/re-close, Blender never crashes. First crash on 0.0.8 (`PhysX_64.dll` delay-loads `PhysXCommon_64.dll`, which `os.add_dll_directory` does NOT cover) → fixed in 0.0.9 by preloading the 3 PhysX DLLs in dependency order via `ctypes.WinDLL` inside `_native_loader.py` | this commit |
 | **5F** | MCP-only practical-scale verification of the Phase 5E pipeline against **CC_Base_Body** (225,184 verts / 397,024 loop triangles, Blender `Armature` modifier). Same Blender (x,y,z) → PhysX (x,z,-y) axis remap as 5E. Buffer build (matrix_world + remap + index extraction) via numpy fast path = **71.8 ms**. PhysX **CPU cooking = 130.1 ms** for 397k triangles. Per-step simulation = **0.081 ms/step** (dominated by BVH traversal). Sphere bounced at step 28 (meaningful interaction confirmed), then exited the body footprint as in 5E. Two cycles bit-deterministic. Blender did not crash. GPU/CUDA unused, Curves/SolverInterface untouched. **No code changes** | (MCP only — see Phase 5E commit `0ee4918`) |
 | **5G** | **GPU / CUDA PhysX lifecycle opened.** Custom preset `vc17win64-gpu-md` (CUDA 12.9, `/MD`, `PX_GENERATE_GPU_PROJECTS=True`, `PX_GENERATE_GPU_REDUCED_ARCHITECTURES=True` → SASS 80/86/89/90/100/120 + PTX 120, Blackwell SM_120 covered) built `PhysXGpu_64.dll` (324 MB). New entry points `physx_gpu_probe_open / status / step / close` in `native/probe.cpp` — **case A: completely separate GPU globals** from the CPU path, mutually exclusive open. `PxCreateCudaContextManager` succeeded, `cuda_device_name = "NVIDIA GeForce RTX 5070 Ti"`, `broadphase_type="GPU"`, `gpu_dynamics_enabled=true`, **`fallback_detected=false`**. Empty-scene `simulate/fetchResults` succeeded across 2 cycles. CPU path regression-free. Blender did not crash | `052cffe` |
-| **5H** | CPU vs GPU **rigid-grid benchmark** (`physx_benchmark_rigid_grid_cpu/gpu` — local PhysX per call, no global pollution; sphere grid on ground plane; restitution=0). 100 / 1000 actors × 120 steps × dt=1/60. **Headline (avg step time)**: CPU 0.067 / GPU 0.789 ms @ 100 → CPU 0.778 / GPU 1.805 ms @ 1000. GPU **`fallback_detected=false`** confirmed both runs (device="NVIDIA GeForce RTX 5070 Ti", broadphase="GPU"). All runs `finite_check=true`, `nan_inf_count=0`. 100-actor checksums CPU/GPU near-identical; 1000-actor GPU settled less in 120 steps (solver-difference, spec allows). 5000-actor + Blender-mesh-collider variants deferred to a later phase | this commit |
+| **5H** | CPU vs GPU **rigid-grid benchmark** (`physx_benchmark_rigid_grid_cpu/gpu` — local PhysX per call, no global pollution; sphere grid on ground plane; restitution=0). 100 / 1000 actors × 120 steps × dt=1/60. **Headline (avg step time)**: CPU 0.067 / GPU 0.789 ms @ 100 → CPU 0.778 / GPU 1.805 ms @ 1000. GPU **`fallback_detected=false`** confirmed both runs (device="NVIDIA GeForce RTX 5070 Ti", broadphase="GPU"). All runs `finite_check=true`, `nan_inf_count=0`. 100-actor checksums CPU/GPU near-identical; 1000-actor GPU settled less in 120 steps (solver-difference, spec allows). 5000-actor + Blender-mesh-collider variants deferred to a later phase | `e7c435a` |
+| **7A-1** | **First real PhysX PBD particle ingestion.** 4000 Curves root points (`i%8==0` of `カーブ.001`) injected as anchor particles into `PxPBDParticleSystem` with `PxVec4.w = 0.0f` → fixed (confirmed in `particlesystem.cu:1596` `if(invMass==0) continue;`). Empty phase (`PxParticlePhaseFlags(0)`, no self-collide, no fluid). `gravity=(0,0,0)/1 step` and `gravity=(0,0,-9.81)/10 steps`: `max_displacement_from_initial=0` both runs, `nan_inf_count=0`, `fallback_detected=false`. GPU device confirmed = "NVIDIA GeForce RTX 5070 Ti". env-var dev mode, no zip bundle, no manifest bump. Local PhysX one-shot per call (no global pollution) | `c0ed932` |
+| **7A-2** | **Broken-path record (NOT committed).** Same probe + 4000 child particles (`invMass=1`) + 4000 distance constraints via the deprecated `PxParticleClothBufferHelper` / `PxParticleSpring` / `PxParticleClothPreProcessor` / `ExtGpu::PxCreateAndPopulateParticleClothBuffer` path with `numTriangles=0`. Result: PhysX internally issued `cuMemAlloc(0 bytes)` for the triangle buffer; CUDA returned `CUDA_ERROR_INVALID_VALUE`; `PxCudaContextManager` entered OOM state; subsequent `simulate()` then `fetchResults()` triggered `EXCEPTION_ACCESS_VIOLATION` in `PhysX_64.dll` → **Blender crash** (`YOKO__EXT_TEST.crash.txt`). Crash impl rolled back from working tree; **no commit produced**. Conclusion: the deprecated cloth-buffer path **does not safe-fail** for spring-only / no-triangle constructions; cannot be used as the primary PBD distance-constraint route. Next step undecided — see "PBD distance constraint blocker" section | (no commit — `git restore`) |
 
 **Phase 3 left no repo changes by design.** Phases 4D, 4D2, 4E left no
 repo changes either (MCP-only). The committed Phase 4 surface is
@@ -155,6 +157,56 @@ discovery** — production bundling is deferred.
   next zip build (whenever Phase 5G is promoted from dev-mode) must
   carry the updated loader. The committed repo `_native_loader.py` is
   the source of truth.
+
+---
+
+## PBD distance constraint blocker (Phase 7A-2) — load-bearing
+
+Phase 7A-2 attempted to attach 4000 child particles to 4000 anchors with
+one distance constraint per pair. The conclusion is a **hard blocker**
+on the deprecated path and must inform any future hair-strand work
+that tries to use PhysX PBD particles for distance constraints.
+
+* **The only PhysX 5.6.1 route for particle-particle distance constraints
+  is the deprecated cloth-buffer family**:
+  `ExtGpu::PxParticleClothBufferHelper`, `PxParticleSpring`,
+  `PxParticleClothPreProcessor`, `PxPartitionedParticleCloth`,
+  `ExtGpu::PxCreateAndPopulateParticleClothBuffer`,
+  `PxParticleClothBuffer`. The non-deprecated `PxParticleBufferDesc` /
+  `ExtGpu::PxCreateAndPopulateParticleBuffer` carries positions,
+  velocities, phases only — no spring field.
+* **That path does not safe-fail with `numTriangles=0`.** What happens
+  on this RTX 5070 Ti + driver 596.36 + CUDA 12.9 + PhysX 5.6.1 stack:
+  PhysX internally issues `cuMemAlloc(0)` for the triangle buffer →
+  CUDA returns `CUDA_ERROR_INVALID_VALUE` → `PxCudaContextManager` is
+  left in an OOM state → next `simulate()` aborts with `NpScene.cpp
+  abort: "PhysX cannot start GPU simulation because the
+  PxCudaContextManager is still in out-of-memory state"` → following
+  `fetchResults()` triggers `EXCEPTION_ACCESS_VIOLATION` inside
+  `PhysX_64.dll` → **Blender process dies** with a `*.crash.txt`.
+* The error is not raised back to the C++ caller; cloth-buffer creation
+  appears to succeed. The crash is one `simulate()` call later.
+* **Implication:** PBD particle distance constraints cannot be obtained
+  by passing springs-with-no-triangles. The cloth path expects at
+  least one triangle. Injecting a fake/degenerate triangle to get past
+  the allocator is "preprocessing to suppress a failure" and was
+  rejected by the user when Phase 7A-2 was scoped, so do not try it
+  without an explicit GO.
+* **Status of Phase 7A-2:** test executed, broken-path observed and
+  recorded; **no commit was produced for the crash implementation**.
+  Phase 7A-1 (`c0ed932`) remains the anchor-only baseline.
+* **Forbidden quick-fixes** (per user, until explicitly re-scoped):
+  - dummy / degenerate triangle injection
+  - making the deprecated cloth buffer the primary route
+  - jumping to `PxD6Joint` rigid bodies as a "drop-in"
+  - writing custom CUDA kernels via `PxParticleSystemCallback::onPostSolve`
+  - tuning damping / stiffness / mass / gravity to mask the crash
+* **Open question for the next phase:** which constraint mechanism
+  will replace this for hair strands? Candidates (none authorized
+  yet): cloth buffer with 1 honest triangle per strand-triple,
+  `PxParticleAttachment` (also deprecated), deformable surface FEM,
+  rigid-body chain with `PxD6Joint`, or a fully custom CUDA-side
+  constraint solver invoked from `PxParticleSystemCallback`.
 
 ---
 
