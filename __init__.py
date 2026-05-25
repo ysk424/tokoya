@@ -1,10 +1,20 @@
-"""Hair Simulation — Phase 1 skeleton.
+"""Hair Simulation — Phase 6A.
 
-Container only: no physics, no collision, no hair deformation.
-Provides Start / Stop / Reset operators, a frame_change_post handler,
-and a placeholder SolverInterface that defines the future C++ boundary.
+First implementation phase: the Phase 1 SolverInterface stub is now
+wired to the C++ deterministic deformation path (Phase 4C's
+deform_position_buffer). Canonical round-trip is Phase 4D2's:
+original Curves baseline -> Python buffer -> C++ deform -> result ->
+original Curves -> update_tag. No PhysX, no CUDA, no collision yet.
+
+Phase 1 invariants preserved: a single persistent frame_change_post
+handler gated by WindowManager.hair_sim_running, Start/Stop/Reset
+operators. Reset does NOT change running state (spec). Start failure
+keeps hair_sim_running=False (no silent running-but-no-op state).
 """
 from __future__ import annotations
+
+import array
+import math
 
 import bpy
 from bpy.app.handlers import persistent
@@ -19,24 +29,139 @@ from . import ui
 # --------------------------------------------------------------------------- #
 
 class SolverInterface:
-    """Phase 1 placeholder for the future native (C++/PhysX) solver.
+    """Phase 6A implementation. Drives a deterministic, non-cumulative
+    C++ deformation of one hard-coded Curves object's ORIGINAL position
+    attribute every frame_change_post.
 
-    The four methods below are the only contact surface between the
-    Blender layer and whatever runs the simulation. Curves / points
-    are intentionally not part of the signature yet — how geometry is
-    handed to the solver is a separate decision."""
+    Hard-coded target is acceptable for Phase 6A; object discovery is
+    a later phase. The deformation is computed from a baseline that is
+    captured exactly once per Start, so step() is independent of any
+    previously written result (non-cumulative)."""
 
-    def start(self) -> None:
-        pass
+    # Phase 6A hard-coded target (YOKO_EXT_TEST.blend).
+    _TARGET_OBJECT_NAME  = "カーブ.001"  # "カーブ.001"
+    _POINTS_PER_STRAND   = 8
+    _ATTRIBUTE_NAME      = "position"
+    _ATTRIBUTE_FIELD     = "vector"     # foreach key for FLOAT_VECTOR
+    _ANIM_FRAME_ORIGIN   = 800
+    _ANIM_FREQ_PER_FRAME = 0.15         # radians per frame
+    _ANIM_AMPLITUDE      = 0.25         # in baseline units (Blender world ~m)
+
+    def __init__(self) -> None:
+        self._native             = None
+        self._baseline           = None   # array.array('f') length = n_points * 3
+        self._n_points           = 0
+        self._step_error_active  = False
+
+    # ---- lifecycle ----
+
+    def start(self) -> bool:
+        """Acquire native module and capture baseline. Returns True only
+        on success; on failure the operator must leave hair_sim_running
+        as False so step() never gets called silently."""
+        self._step_error_active = False
+        self._native   = None
+        self._baseline = None
+        self._n_points = 0
+
+        from . import _native_loader
+        native = _native_loader.get_native()
+        if native is None or not hasattr(native, "deform_position_buffer"):
+            print("[hair_sim] start failed: native module / deform_position_buffer unavailable")
+            return False
+
+        obj = bpy.data.objects.get(self._TARGET_OBJECT_NAME)
+        if obj is None or obj.type != "CURVES":
+            print(f"[hair_sim] start failed: target '{self._TARGET_OBJECT_NAME}' missing or not Curves")
+            return False
+
+        attrs = obj.data.attributes
+        pos = attrs.get(self._ATTRIBUTE_NAME)
+        if pos is None:
+            print(f"[hair_sim] start failed: attribute '{self._ATTRIBUTE_NAME}' missing on target")
+            return False
+
+        n_points = len(pos.data)
+        if n_points == 0 or n_points % self._POINTS_PER_STRAND != 0:
+            print(f"[hair_sim] start failed: unexpected point_count={n_points} "
+                  f"(must be > 0 and multiple of {self._POINTS_PER_STRAND})")
+            return False
+
+        baseline = array.array('f', [0.0] * (n_points * 3))
+        pos.data.foreach_get(self._ATTRIBUTE_FIELD, baseline)
+
+        self._native   = native
+        self._baseline = baseline
+        self._n_points = n_points
+        print(f"[hair_sim] start: captured baseline "
+              f"({n_points} points / {n_points // self._POINTS_PER_STRAND} strands)")
+        return True
 
     def stop(self) -> None:
-        pass
+        """Spec: Stop does not touch baseline (so Reset-after-Stop still
+        works) and does not flip hair_sim_running (the operator owns
+        that). Step() naturally stops being called once running=False."""
+        return None
 
     def reset(self) -> None:
-        pass
+        """Spec: Reset restores original Curves to the captured baseline
+        when one exists. Does NOT change hair_sim_running. Without a
+        captured baseline this is a no-op."""
+        if self._baseline is None:
+            return
+        obj = bpy.data.objects.get(self._TARGET_OBJECT_NAME)
+        if obj is None or obj.type != "CURVES":
+            return
+        attr = obj.data.attributes.get(self._ATTRIBUTE_NAME)
+        if attr is None or len(attr.data) != self._n_points:
+            return
+        attr.data.foreach_set(self._ATTRIBUTE_FIELD, self._baseline)
+        obj.data.update_tag()
+
+    # ---- per-frame ----
 
     def step(self, scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> None:
-        pass
+        if self._step_error_active:
+            return
+        if self._native is None or self._baseline is None:
+            return
+        try:
+            frame = scene.frame_current
+            amp = math.sin((frame - self._ANIM_FRAME_ORIGIN)
+                            * self._ANIM_FREQ_PER_FRAME) * self._ANIM_AMPLITUDE
+
+            r = self._native.deform_position_buffer(
+                expected_point_count=self._n_points,
+                expected_float_count=self._n_points * 3,
+                points_per_strand=self._POINTS_PER_STRAND,
+                frame_current=frame,
+                amplitude=float(amp),
+                input_buf=self._baseline,        # non-cumulative input every step
+            )
+            if not r.get("accepted"):
+                return  # C++ validation rejected; do not corrupt curves
+            result_bytes = r.get("result_buffer")
+            if not result_bytes:
+                return
+
+            result_buf = array.array('f')
+            result_buf.frombytes(result_bytes)
+            if len(result_buf) != self._n_points * 3:
+                return  # length mismatch; refuse to write
+
+            obj = bpy.data.objects.get(self._TARGET_OBJECT_NAME)
+            if obj is None:
+                return
+            attr = obj.data.attributes.get(self._ATTRIBUTE_NAME)
+            if attr is None or len(attr.data) != self._n_points:
+                return  # target changed under us; skip
+
+            attr.data.foreach_set(self._ATTRIBUTE_FIELD, result_buf)
+            obj.data.update_tag()
+        except Exception as exc:
+            # One-shot error report; further steps become no-ops until next start().
+            self._step_error_active = True
+            print(f"[hair_sim] step error (suppressing further steps): {exc!r}")
 
 
 _solver = SolverInterface()
@@ -79,8 +204,15 @@ class HAIR_SIM_OT_start(Operator):
         wm = context.window_manager
         if wm.hair_sim_running:
             return {"FINISHED"}
-        _solver.start()
+        # Phase 6A: only flip running when the solver actually started.
+        # If start() returns False (native unavailable, target missing,
+        # bad point count, ...), we leave hair_sim_running=False so the
+        # handler never enters a silent running-but-no-op state.
+        if not _solver.start():
+            self.report({"ERROR"}, "Hair sim start failed (see system console)")
+            return {"CANCELLED"}
         wm.hair_sim_running = True
+        self.report({"INFO"}, "Hair sim running")
         return {"FINISHED"}
 
 
