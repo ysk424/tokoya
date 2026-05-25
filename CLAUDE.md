@@ -208,6 +208,75 @@ that tries to use PhysX PBD particles for distance constraints.
   rigid-body chain with `PxD6Joint`, or a fully custom CUDA-side
   constraint solver invoked from `PxParticleSystemCallback`.
 
+### Source-level follow-up (Phase 7A-2H hypothesis probe — also rolled back)
+
+A second in-Blender probe with `maxTriangles=1000` (capacity > 0, but
+`nbTriangles=0`, no dummy triangle data) was attempted to test whether
+the previous crash was specifically a capacity-zero allocation issue.
+It **crashed identically** (same `cuMemAlloc(0 bytes)`, same access
+violation in `PhysX_64.dll` at the same DLL-internal offset, just a
+different ASLR base). That hypothesis is therefore **falsified** — the
+0-byte allocation is not solely tied to `maxTriangles`.
+
+A PhysX 5.6.1 source-trace narrowed the cause down further. Key facts
+verified by reading the PhysX SDK source tree directly:
+
+* **Crash origin** is `physx/source/gpucommon/src/PxgCudaMemoryAllocator.cpp:135–141` —
+  `cudaContext.memAlloc(&ptr, size)` with `size == 0` returns
+  `CUDA_ERROR_INVALID_VALUE (=1)`. The allocator then calls
+  `cudaContext.setAbortMode(true)`, which is the OOM-state ratchet
+  reported by the next `simulate()` call (`NpScene.cpp:3036`). Any
+  `nElements * sizeof(T) == 0` reaches this path.
+* **maxTriangles=0 case** allocates 0 bytes at
+  `PxgParticleSystemCore.cpp:380`
+  (`PX_DEVICE_MEMORY_ALLOC(PxU32, ctx, maxNumTriangles * 3)`) inside
+  `PxgParticleClothBuffer::PxgParticleClothBuffer`. The
+  `PX_ASSERT(maxNumParticles > 0 && maxNumTriangles > 0)` directly
+  above this is a release-build no-op, so the contract is silently
+  violated.
+* **maxTriangles=1000 case**: the constructor allocation succeeds, but
+  `setCloths(output)` (`PxgParticleSystemCore.cpp:405–466`) does
+  further device allocations sized by `mNumActiveParticles`,
+  `mNumPartitions`, `mNumSprings` (guarded), `mNumCloths` (unguarded),
+  and `mRemapOutputSize` (unguarded). Any one of these being 0
+  reproduces the same crash signature. The downstream solver kernels
+  themselves are guarded (`solveSprings`, `solveInflatables`,
+  `solveAerodynamics` all have `> 0` early-outs) — the failure is
+  purely in the allocator path.
+* **Architectural implication**: the cloth path was designed for woven
+  cloth, not spring-only rigs. `nbTriangles == 0` is not a supported
+  configuration even when the kernels could handle it. The deprecation
+  tags throughout (`PxParticleSpring`, `PxParticleCloth*`,
+  `addRigidAttachment`, etc.) reinforce that NVIDIA isn't maintaining
+  edge cases of this path. The snippet header comment in
+  `SnippetPBDCloth.cpp` literally says "Particle cloth has been
+  DEPRECATED. Please use PxDeformableSurface instead."
+* **Open candidates that remain** (without an out-of-Blender probe we
+  can't pick one):
+  - `nbCloths == 0` at `setCloths` time (`PxgParticleSystemCore.cpp`
+    lines 444 / 445 / 448).
+  - `output.nbPartitions == 0` (line 431) — only possible if
+    `partitionSprings` was skipped or output was default-constructed.
+  - `numActiveParticles == 0` (line 430) — only possible if
+    `setNbActiveParticles` wasn't called.
+* **Recovery**: once `setAbortMode(true)` ratchets on a
+  `PxCudaContext`, the process must be torn down and a fresh
+  `PxCudaContextManager` created. There is no in-process recovery —
+  this is why Blender dies even though our `try/except` catches the
+  Python-level exception.
+* **Forbidden quick-fixes (still)**: dummy triangle injection,
+  `setAbortMode` workaround, in-process retry. Adding 1 dummy triangle
+  alone may not even fix the crash if the second unguarded zero
+  (e.g., `nbCloths == 0`) is actually what's biting in our setup.
+
+**Next-phase plan**: a standalone C++ probe outside Blender, derived
+from `SnippetPBDCloth.cpp`, toggling Arm A (`addCloth` called once,
+`nbCloths=1`, `nbTriangles=0`, partitioned springs) vs Arm B
+(`addCloth` skipped, default-constructed `PxPartitionedParticleCloth`)
+to isolate which unguarded allocation actually fires for our 4000
+anchor + 4000 child + 4000 springs configuration. **No in-Blender
+retry until that standalone probe disambiguates.**
+
 ---
 
 ## Phase 5H benchmark headline (CPU vs GPU rigid grid)
