@@ -1,4 +1,4 @@
-// Phase 2B/4A/4B/4C/5A/5B/5C/5D/5E/5G/5H/6B/6C placeholder module.
+// Phase 2B/4A/4B/4C/5A/5B/5C/5D/5E/5G/5H/6B/6C/7A1 placeholder module.
 // Module name, function names, and phase attribute are experimental
 // and will change before any real solver wiring.
 //
@@ -50,11 +50,19 @@
 //                                  + fixed roots + gravity along -Z in
 //                                  Curves local space; first real physics
 //                                  state; still no PhysX, no collision)
+//   7A-1: physx_pbd_probe_anchor_only
+//                                 (first real PhysX PBD particle ingestion;
+//                                  N anchors with invMass=0 -> fixed; empty
+//                                  phase (no self-collide, no fluid); no
+//                                  children, no springs, no cloth buffer;
+//                                  local PhysX one-shot per call)
 #include <pybind11/pybind11.h>
 
 #include <PxPhysicsAPI.h>
 #include <cooking/PxCooking.h>
 #include <cudamanager/PxCudaContextManager.h>
+#include <cudamanager/PxCudaContext.h>
+#include <extensions/PxParticleExt.h>
 
 #include <chrono>
 #include <cmath>
@@ -2297,6 +2305,308 @@ py::dict NativeHairSolver::close()
     return d;
 }
 
+// ---------------------------------------------------------------------- //
+// Phase 7A-1: PhysX PBD anchor-only probe
+//
+// First real PhysX PBD particle ingestion using real Curves-derived data.
+// Each call builds a completely local PhysX stack including a CUDA-bound
+// PxPBDParticleSystem, populates it with N anchor particles (invMass=0
+// in the PxVec4 position buffer is the documented "infinite mass / no
+// response" path in PhysX 5.6 — confirmed in particlesystem.cu kernel),
+// simulates step_count steps and reads positions back via cudaContext
+// memcpyDtoH. No children, no springs, no cloth buffer (deprecated path
+// deliberately avoided), no self-collision, no body collision. The probe
+// must reject CPU fallback as failure.
+// ---------------------------------------------------------------------- //
+
+py::dict physx_pbd_probe_anchor_only(
+    py::buffer    anchor_positions_buf,
+    unsigned int  particle_count,
+    unsigned int  step_count,
+    float         dt,
+    float         gravity_x,
+    float         gravity_y,
+    float         gravity_z)
+{
+    py::dict d;
+    d["mode"]                = std::string("PBD_anchor_only");
+    d["particle_count"]      = particle_count;
+    d["step_count"]          = step_count;
+    d["dt"]                  = dt;
+    d["gravity"]             = py::make_tuple(gravity_x, gravity_y, gravity_z);
+    d["inv_mass_policy"]     = std::string("0.0f means fixed anchor (PxVec4.w = 0)");
+    d["fallback_detected"]   = false;
+    d["cuda_context_created"]= false;
+
+    // Cross-rejection with any open probe lifecycle.
+    if (g_foundation != nullptr || g_gpu_foundation != nullptr) {
+        d["accepted"] = false;
+        d["message"]  = "rejected: a CPU or GPU probe context is open; close it first";
+        return d;
+    }
+
+    if (particle_count == 0u || step_count == 0u || !(dt > 0.0f)) {
+        d["accepted"] = false;
+        d["message"]  = "rejected: particle_count>0, step_count>0, dt>0 required";
+        return d;
+    }
+
+    // Validate input position buffer (float32, length = particle_count*3).
+    py::buffer_info info = anchor_positions_buf.request(/*writable=*/false);
+    if (info.itemsize != static_cast<py::ssize_t>(sizeof(float))
+        || info.format != py::format_descriptor<float>::format()
+        || info.size != static_cast<py::ssize_t>(particle_count * 3u)) {
+        d["accepted"]              = false;
+        d["anchor_buf_itemsize"]   = static_cast<int>(info.itemsize);
+        d["anchor_buf_size"]       = static_cast<long long>(info.size);
+        d["message"]               = "rejected: anchor_positions must be float32 length particle_count*3";
+        return d;
+    }
+    const float* in_pos = static_cast<const float*>(info.ptr);
+
+    // ---- Foundation ----
+    PxFoundation* fnd = PxCreateFoundation(PX_PHYSICS_VERSION, g_allocator, g_error_callback);
+    if (fnd == nullptr) {
+        d["accepted"] = false;
+        d["message"]  = "PxCreateFoundation failed";
+        return d;
+    }
+
+    // ---- CUDA context (safe-fail) ----
+    PxCudaContextManagerDesc cudaDesc;
+    PxCudaContextManager* cuda_ctx = PxCreateCudaContextManager(*fnd, cudaDesc);
+    if (cuda_ctx == nullptr || !cuda_ctx->contextIsValid()) {
+        if (cuda_ctx != nullptr) cuda_ctx->release();
+        fnd->release();
+        d["accepted"]            = false;
+        d["fallback_detected"]   = true;
+        d["cuda_context_created"]= false;
+        d["message"]             = "GPU init failed (PxCreateCudaContextManager null/invalid)";
+        return d;
+    }
+    d["cuda_context_created"] = true;
+    {
+        const char* nm = cuda_ctx->getDeviceName();
+        d["cuda_device_name"] = std::string(nm ? nm : "(unknown)");
+    }
+    d["cuda_device_count"] = 1;
+
+    // ---- Physics ----
+    PxPhysics* phy = PxCreatePhysics(PX_PHYSICS_VERSION, *fnd, PxTolerancesScale(), false, nullptr);
+    if (phy == nullptr) {
+        cuda_ctx->release(); fnd->release();
+        d["accepted"] = false;
+        d["message"]  = "PxCreatePhysics failed";
+        return d;
+    }
+
+    // ---- Dispatcher ----
+    PxDefaultCpuDispatcher* disp = PxDefaultCpuDispatcherCreate(2);
+    if (disp == nullptr) {
+        phy->release(); cuda_ctx->release(); fnd->release();
+        d["accepted"] = false;
+        d["message"]  = "PxDefaultCpuDispatcherCreate failed";
+        return d;
+    }
+
+    // ---- Scene (GPU dynamics + GPU broadphase required for PBD particles) ----
+    PxSceneDesc sd(phy->getTolerancesScale());
+    sd.gravity            = PxVec3(gravity_x, gravity_y, gravity_z);
+    sd.cpuDispatcher      = disp;
+    sd.filterShader       = PxDefaultSimulationFilterShader;
+    sd.cudaContextManager = cuda_ctx;
+    sd.flags             |= PxSceneFlag::eENABLE_GPU_DYNAMICS;
+    sd.broadPhaseType     = PxBroadPhaseType::eGPU;
+
+    PxScene* sc = phy->createScene(sd);
+    if (sc == nullptr) {
+        disp->release(); phy->release(); cuda_ctx->release(); fnd->release();
+        d["accepted"]          = false;
+        d["fallback_detected"] = true;
+        d["message"]           = "createScene failed";
+        return d;
+    }
+
+    // GPU verification (reject silent CPU fallback as failure).
+    {
+        const PxSceneFlags actualFlags = sc->getFlags();
+        const bool gpu_dyn = bool(actualFlags & PxSceneFlag::eENABLE_GPU_DYNAMICS);
+        const PxBroadPhaseType::Enum bp = sc->getBroadPhaseType();
+        d["gpu_dynamics_enabled"]   = gpu_dyn;
+        d["broadphase_type"]        = broadphase_type_name(bp);
+        d["gpu_broadphase_enabled"] = (bp == PxBroadPhaseType::eGPU);
+        if (!gpu_dyn || bp != PxBroadPhaseType::eGPU) {
+            sc->release(); disp->release(); phy->release(); cuda_ctx->release(); fnd->release();
+            d["accepted"]          = false;
+            d["fallback_detected"] = true;
+            d["message"]           = "GPU scene fell back to CPU; rejecting per spec";
+            return d;
+        }
+    }
+
+    // ---- PBD material (values from snippetpbdcloth as a baseline) ----
+    PxPBDMaterial* mat = phy->createPBDMaterial(
+        /*friction=*/0.8f, /*damping=*/0.05f, /*adhesion=*/1e+6f,
+        /*viscosity=*/0.001f, /*vorticityConfinement=*/0.5f,
+        /*surfaceTension=*/0.005f, /*cohesion=*/0.05f,
+        /*lift=*/0.0f, /*drag=*/0.0f);
+    if (mat == nullptr) {
+        sc->release(); disp->release(); phy->release(); cuda_ctx->release(); fnd->release();
+        d["accepted"] = false;
+        d["message"]  = "createPBDMaterial failed";
+        return d;
+    }
+
+    // ---- PBD particle system ----
+    PxPBDParticleSystem* ps = phy->createPBDParticleSystem(*cuda_ctx);
+    if (ps == nullptr) {
+        mat->release();
+        sc->release(); disp->release(); phy->release(); cuda_ctx->release(); fnd->release();
+        d["accepted"] = false;
+        d["message"]  = "createPBDParticleSystem failed";
+        return d;
+    }
+    const PxReal restOffset = 0.01f;
+    ps->setRestOffset(restOffset);
+    ps->setContactOffset(restOffset + 0.005f);
+    ps->setParticleContactOffset(restOffset + 0.005f);
+    ps->setSolidRestOffset(restOffset);
+    ps->setFluidRestOffset(0.0f);
+    sc->addActor(*ps);
+
+    // Empty phase: no self-collide, no fluid (Phase 7A-1 explicit rule).
+    const PxU32 particlePhase = ps->createPhase(mat, PxParticlePhaseFlags(0));
+
+    // ---- Populate buffers (pageable host arrays; PhysX copies on creation) ----
+    std::vector<PxVec4> positions(particle_count);
+    std::vector<PxVec4> velocities(particle_count, PxVec4(0.0f));
+    std::vector<PxU32>  phases(particle_count, particlePhase);
+    for (unsigned int i = 0; i < particle_count; ++i) {
+        positions[i] = PxVec4(in_pos[i*3u + 0], in_pos[i*3u + 1], in_pos[i*3u + 2],
+                              /*invMass=*/0.0f);  // anchor
+    }
+
+    ExtGpu::PxParticleBufferDesc bufDesc;
+    bufDesc.maxParticles        = particle_count;
+    bufDesc.numActiveParticles  = particle_count;
+    bufDesc.positions           = positions.data();
+    bufDesc.velocities          = velocities.data();
+    bufDesc.phases              = phases.data();
+
+    PxParticleBuffer* buf = ExtGpu::PxCreateAndPopulateParticleBuffer(bufDesc, cuda_ctx);
+    if (buf == nullptr) {
+        sc->removeActor(*ps); ps->release(); mat->release();
+        sc->release(); disp->release(); phy->release(); cuda_ctx->release(); fnd->release();
+        d["accepted"] = false;
+        d["message"]  = "PxCreateAndPopulateParticleBuffer failed";
+        return d;
+    }
+    ps->addParticleBuffer(buf);
+
+    // ---- Simulate ----
+    bool sim_ok = true;
+    std::string sim_err;
+    try {
+        for (unsigned int s = 0; s < step_count; ++s) {
+            sc->simulate(dt);
+            sc->fetchResults(true);
+        }
+    } catch (const std::exception& e) {
+        sim_ok = false;
+        sim_err = std::string("simulate exception: ") + e.what();
+    } catch (...) {
+        sim_ok = false;
+        sim_err = "simulate unknown exception";
+    }
+
+    // ---- Read back positions (device -> host memcpy) ----
+    // memcpyDtoH returns PxCUresult (PxCUenum<CUresult> internally). The
+    // snippet pattern (SnippetPBDClothRender.cpp:73) drops the return.
+    // We follow that; if the copy silently failed we'll see it in the
+    // analyzed data (readback stays zero-initialized -> huge displacement).
+    std::vector<PxVec4> readback(particle_count);
+    bool readback_ok = true;
+    try {
+        cuda_ctx->acquireContext();
+        PxCudaContext* cc = cuda_ctx->getCudaContext();
+        PxVec4* device_pos = buf->getPositionInvMasses();
+        cc->memcpyDtoH(
+            readback.data(),
+            CUdeviceptr(device_pos),
+            sizeof(PxVec4) * static_cast<std::size_t>(particle_count));
+        cuda_ctx->releaseContext();
+    } catch (...) {
+        readback_ok = false;
+    }
+
+    // ---- Analyze ----
+    double max_disp = 0.0;
+    double sum_disp = 0.0;
+    int nan_inf = 0;
+    int analyzed = 0;
+    if (readback_ok) {
+        for (unsigned int i = 0; i < particle_count; ++i) {
+            const PxVec4& rp = readback[i];
+            if (!std::isfinite(rp.x) || !std::isfinite(rp.y) || !std::isfinite(rp.z)) {
+                nan_inf++;
+                continue;
+            }
+            const float ox = in_pos[i*3u + 0];
+            const float oy = in_pos[i*3u + 1];
+            const float oz = in_pos[i*3u + 2];
+            const float dx = rp.x - ox;
+            const float dy = rp.y - oy;
+            const float dz = rp.z - oz;
+            const double dist = std::sqrt(static_cast<double>(dx*dx + dy*dy + dz*dz));
+            sum_disp += dist;
+            if (dist > max_disp) max_disp = dist;
+            analyzed++;
+        }
+    }
+
+    d["first_anchor_initial"] = py::make_tuple(in_pos[0], in_pos[1], in_pos[2]);
+    d["last_anchor_initial"]  = py::make_tuple(
+        in_pos[(particle_count-1)*3u + 0],
+        in_pos[(particle_count-1)*3u + 1],
+        in_pos[(particle_count-1)*3u + 2]);
+    if (readback_ok && particle_count > 0) {
+        d["first_anchor_final"] = py::make_tuple(readback[0].x, readback[0].y, readback[0].z);
+        d["last_anchor_final"]  = py::make_tuple(
+            readback[particle_count-1].x,
+            readback[particle_count-1].y,
+            readback[particle_count-1].z);
+    }
+    d["readback_ok"]                     = readback_ok;
+    d["nan_inf_count"]                   = nan_inf;
+    d["analyzed_particle_count"]         = analyzed;
+    d["max_displacement_from_initial"]   = max_disp;
+    d["average_displacement_from_initial"] = (analyzed > 0)
+        ? (sum_disp / static_cast<double>(analyzed)) : 0.0;
+    d["rest_offset"]                     = restOffset;
+
+    // ---- Cleanup (reverse order; release every PhysX object) ----
+    ps->removeParticleBuffer(buf);
+    buf->release();
+    sc->removeActor(*ps);
+    ps->release();
+    mat->release();
+    sc->release();
+    disp->release();
+    phy->release();
+    cuda_ctx->release();
+    fnd->release();
+
+    d["accepted"] = sim_ok && readback_ok;
+    if (!sim_ok) {
+        d["message"] = sim_err;
+    } else if (!readback_ok) {
+        d["message"] = "simulate ok but cudaMemcpyDtoH failed";
+    } else {
+        d["message"] = "PBD anchor-only probe completed";
+    }
+    return d;
+}
+
 PYBIND11_MODULE(phase2b_probe, m) {
     m.attr("phase") = "2B";
     m.def("add", &add);
@@ -2381,4 +2691,14 @@ PYBIND11_MODULE(phase2b_probe, m) {
           py::arg("sphere_density")= 1.0f,
           py::arg("grid_spacing")  = 0.2f,
           py::arg("grid_origin_y") = 1.0f);
+
+    // Phase 7A-1: PBD particle anchor-only probe.
+    m.def("physx_pbd_probe_anchor_only", &physx_pbd_probe_anchor_only,
+          py::arg("anchor_positions_buf"),
+          py::arg("particle_count"),
+          py::arg("step_count") = 1u,
+          py::arg("dt")         = 1.0f / 60.0f,
+          py::arg("gravity_x")  = 0.0f,
+          py::arg("gravity_y")  = 0.0f,
+          py::arg("gravity_z")  = 0.0f);
 }
