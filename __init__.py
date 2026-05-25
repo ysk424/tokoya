@@ -1,23 +1,26 @@
-"""Hair Simulation — Phase 6B.
+"""Hair Simulation — VBD-direction Phase 0: world-coord passthrough.
 
-First real solver architecture step. SolverInterface now owns a
-stateful native solver instance (`NativeHairSolver`, a pybind11 class
-in the native module) instead of calling a stateless C++ helper. The
-native solver stores the baseline and a reusable output buffer; the
-visible deformation (frame 800 baseline, 805/815/840 deterministic
-offsets) matches Phase 6A exactly.
+`SolverInterface` is wired to `WorldPassthrough` (in `_world_passthrough`).
+The passthrough reads all Curves positions in world coordinates each
+frame_change_post, passes them through a dummy identity function, and
+writes them back. No physics yet — this exists to nail the data path
+that a real VBD solver will plug into.
 
-Canonical round-trip is still Phase 4D2's: original Curves baseline ->
-NativeHairSolver -> result_buffer -> original Curves -> update_tag.
-No PhysX, no CUDA, no collision yet.
+The Surface Deform Geometry Nodes modifier "サーフェス変形" is muted
+while the passthrough is running so that the round-trip is bit-exact
+between what the dummy returns and what the viewport shows. Stop
+restores the modifier's prior `show_viewport`. `unregister()` also
+restores it as a safety net.
+
+The C++ `NativeHairSolver` from Phase 6C and the Warp `_warp_kernels`
+infra (Phase 7W-B) remain in place for historical reference and are
+not called from this code path.
 
 Phase 1 invariants preserved: a single persistent frame_change_post
-handler gated by WindowManager.hair_sim_running, Start/Stop/Reset
-operators. Reset does NOT change running state (spec). Start failure
-keeps hair_sim_running=False (no silent running-but-no-op state).
-Restart behavior: each successful Start re-instantiates a fresh
-NativeHairSolver and re-captures baseline from current original Curves
-(so Stop -> Reset -> Start gives a clean cycle).
+handler gated by WindowManager.hair_sim_running; Start/Stop/Reset
+operators with idempotent semantics. Reset does NOT change running
+state. Start failure keeps `hair_sim_running=False` so the handler
+can never enter a silent running-but-no-op state.
 """
 from __future__ import annotations
 
@@ -36,155 +39,69 @@ from . import ui
 # --------------------------------------------------------------------------- #
 
 class SolverInterface:
-    """Phase 6B implementation. Holds a stateful native solver instance
-    (`NativeHairSolver`, a pybind11 class) for the lifetime of the
-    Python solver. step() delegates to `_native_solver.step(frame)`,
-    which returns a `result_buffer` (py::bytes) computed from the
-    baseline that the native solver captured at initialize time."""
+    """VBD-prep: thin delegator to `WorldPassthrough`. Owns a single
+    passthrough instance for the lifetime of the running session;
+    `start()` re-instantiates it. The C++ `NativeHairSolver` path
+    from Phase 6C is intentionally NOT called from here."""
 
-    # Phase 6A hard-coded target (YOKO_EXT_TEST.blend).
-    _TARGET_OBJECT_NAME  = "カーブ.001"
-    _POINTS_PER_STRAND   = 8
-    _ATTRIBUTE_NAME      = "position"
-    _ATTRIBUTE_FIELD     = "vector"     # foreach key for FLOAT_VECTOR
+    _TARGET_OBJECT_NAME = "カーブ.001"
 
     def __init__(self) -> None:
-        self._native             = None    # native module ref (for hasattr checks)
-        self._native_solver      = None    # NativeHairSolver instance
-        self._n_points           = 0
-        self._step_error_active  = False
+        self._passthrough = None  # WorldPassthrough instance set by start()
 
     # ---- lifecycle ----
 
     def start(self) -> bool:
-        """Acquire native module, capture baseline, and instantiate +
-        initialize a fresh NativeHairSolver. Returns True only on
-        success; on failure the operator must leave hair_sim_running
-        as False so step() never gets called silently."""
-        self._step_error_active = False
-        self._native        = None
-        self._native_solver = None
-        self._n_points      = 0
-
-        from . import _native_loader
-        native = _native_loader.get_native()
-        if native is None or not hasattr(native, "NativeHairSolver"):
-            print("[hair_sim] start failed: native module / NativeHairSolver class unavailable")
-            return False
-
-        obj = bpy.data.objects.get(self._TARGET_OBJECT_NAME)
-        if obj is None or obj.type != "CURVES":
-            print(f"[hair_sim] start failed: target '{self._TARGET_OBJECT_NAME}' missing or not Curves")
-            return False
-
-        attrs = obj.data.attributes
-        pos = attrs.get(self._ATTRIBUTE_NAME)
-        if pos is None:
-            print(f"[hair_sim] start failed: attribute '{self._ATTRIBUTE_NAME}' missing on target")
-            return False
-
-        n_points = len(pos.data)
-        if n_points == 0 or n_points % self._POINTS_PER_STRAND != 0:
-            print(f"[hair_sim] start failed: unexpected point_count={n_points} "
-                  f"(must be > 0 and multiple of {self._POINTS_PER_STRAND})")
-            return False
-
-        baseline = array.array('f', [0.0] * (n_points * 3))
-        pos.data.foreach_get(self._ATTRIBUTE_FIELD, baseline)
+        """Instantiate a fresh `WorldPassthrough`. Returns True only on
+        success; on failure the operator must leave
+        `hair_sim_running=False` so the handler never enters a silent
+        running-but-no-op state."""
+        self._passthrough = None
 
         try:
-            solver = native.NativeHairSolver()
-            init_r = solver.initialize(
-                point_count=n_points,
-                points_per_strand=self._POINTS_PER_STRAND,
-                baseline_buf=baseline,
-            )
+            from . import _world_passthrough
         except Exception as exc:
-            print(f"[hair_sim] start failed: NativeHairSolver construct/initialize raised: {exc!r}")
+            print(f"[hair_sim] start failed: import _world_passthrough: {exc!r}")
             return False
 
-        if not init_r.get("accepted") or not init_r.get("initialized"):
-            print(f"[hair_sim] start failed: NativeHairSolver.initialize rejected: "
-                  f"{init_r.get('message')!r}")
+        obj = bpy.data.objects.get(_world_passthrough.TARGET_NAME)
+        if obj is None or obj.type != "CURVES":
+            print(f"[hair_sim] start failed: target "
+                  f"'{_world_passthrough.TARGET_NAME}' missing or not Curves")
             return False
 
-        self._native        = native
-        self._native_solver = solver
-        self._n_points      = n_points
-        print(f"[hair_sim] start: NativeHairSolver init ok "
-              f"(point_count={init_r.get('point_count')}, "
-              f"strand_count={init_r.get('strand_count')}, "
-              f"points_per_strand={init_r.get('points_per_strand')})")
+        pt = _world_passthrough.WorldPassthrough()
+        if not pt.start(obj):
+            return False
+
+        self._passthrough = pt
         return True
 
     def stop(self) -> None:
-        """Spec: Stop does not destroy the native solver and does not flip
-        hair_sim_running (the operator owns that). The native solver
-        keeps its baseline so Reset-after-Stop still restores cleanly."""
-        return None
+        """Spec: Stop restores the GN modifier's prior `show_viewport`
+        and does NOT flip `hair_sim_running` (the operator owns that).
+        The passthrough does not retain Curves history, so there is
+        nothing else to preserve."""
+        if self._passthrough is not None:
+            self._passthrough.stop()
 
     def reset(self) -> None:
-        """Spec: Reset restores original Curves to the captured baseline.
-        Does NOT change hair_sim_running. If no solver is initialized
-        this is a no-op."""
-        if self._native_solver is None:
+        """Spec: Reset is a no-op for the identity passthrough. Does
+        NOT change `hair_sim_running`. Does NOT touch the GN modifier
+        mute state (Reset is not Stop)."""
+        if self._passthrough is None:
             return
-        try:
-            r = self._native_solver.reset()
-        except Exception as exc:
-            print(f"[hair_sim] reset error: {exc!r}")
-            return
-        if not r.get("accepted"):
-            return
-        result_bytes = r.get("result_buffer")
-        if not result_bytes:
-            return
-        buf = array.array('f')
-        buf.frombytes(result_bytes)
-        if len(buf) != self._n_points * 3:
-            return
-        obj = bpy.data.objects.get(self._TARGET_OBJECT_NAME)
-        if obj is None:
-            return
-        attr = obj.data.attributes.get(self._ATTRIBUTE_NAME)
-        if attr is None or len(attr.data) != self._n_points:
-            return
-        attr.data.foreach_set(self._ATTRIBUTE_FIELD, buf)
-        obj.data.update_tag()
+        self._passthrough.reset()
 
     # ---- per-frame ----
 
     def step(self, scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> None:
-        if self._step_error_active:
+        if self._passthrough is None:
             return
-        if self._native_solver is None:
-            return
-        try:
-            r = self._native_solver.step(frame_current=int(scene.frame_current))
-            if not r.get("accepted"):
-                return
-            result_bytes = r.get("result_buffer")
-            if not result_bytes:
-                return
-
-            result_buf = array.array('f')
-            result_buf.frombytes(result_bytes)
-            if len(result_buf) != self._n_points * 3:
-                return  # length mismatch; refuse to write
-
-            obj = bpy.data.objects.get(self._TARGET_OBJECT_NAME)
-            if obj is None:
-                return
-            attr = obj.data.attributes.get(self._ATTRIBUTE_NAME)
-            if attr is None or len(attr.data) != self._n_points:
-                return  # target changed under us; skip
-
-            attr.data.foreach_set(self._ATTRIBUTE_FIELD, result_buf)
-            obj.data.update_tag()
-        except Exception as exc:
-            # One-shot error report; further steps become no-ops until next start().
-            self._step_error_active = True
-            print(f"[hair_sim] step error (suppressing further steps): {exc!r}")
+        # WorldPassthrough swallows its own exceptions and disables
+        # itself via _step_error_active. We never raise out of the
+        # handler.
+        self._passthrough.step()
 
 
 _solver = SolverInterface()
@@ -314,6 +231,14 @@ def register() -> None:
 
 
 def unregister() -> None:
+    # Safety net: if the user disables the extension while the
+    # passthrough is still running, the Surface Deform GN modifier
+    # would otherwise stay muted in the scene. Stop the solver first
+    # so its saved show_viewport value is restored.
+    try:
+        _solver.stop()
+    except Exception:
+        pass
     _uninstall_handler()
     ui.unregister()
     del WindowManager.hair_sim_running

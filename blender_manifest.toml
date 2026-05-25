@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "hair_sim_physx"
-version = "0.0.18"
+version = "0.0.19"
 name = "Hair Simulation"
 tagline = "Hair simulation skeleton (Phase 1)"
 maintainer = "azoo <ysk424@hotmail.com>"
@@ -21,6 +21,7 @@ paths = [
     "ui.py",
     "_native_loader.py",
     "_warp_kernels.py",
+    "_world_passthrough.py",
     "native/phase2b_probe.cp313-win_amd64.pyd",
     "native/PhysX_64.dll",
     "native/PhysXCommon_64.dll",
