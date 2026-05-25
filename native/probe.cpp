@@ -1,5 +1,5 @@
-// Phase 2B/4A/4B/4C/5A/5B/5C/5D/5E/5G/5H placeholder module. Module name,
-// function names, and phase attribute are experimental and will
+// Phase 2B/4A/4B/4C/5A/5B/5C/5D/5E/5G/5H/6B placeholder module. Module
+// name, function names, and phase attribute are experimental and will
 // change before any real solver wiring.
 //
 // Phase history of this file:
@@ -39,6 +39,12 @@
 //                                  on a ground plane; sphere grid; local
 //                                  PhysX per call; no global pollution;
 //                                  GPU rejects fallback as failure)
+//   6B: class NativeHairSolver    (stateful native solver shell exposed
+//                                  to Python via pybind11; owns baseline +
+//                                  reusable output buffer; deterministic
+//                                  deformation same as Phase 6A; first
+//                                  real solver architecture step — still
+//                                  no PhysX, no collision, no GPU)
 #include <pybind11/pybind11.h>
 
 #include <PxPhysicsAPI.h>
@@ -1892,6 +1898,236 @@ py::dict physx_benchmark_rigid_grid_gpu(
         sphere_radius, sphere_density, grid_spacing, grid_origin_y);
 }
 
+// ---------------------------------------------------------------------- //
+// Phase 6B: stateful native hair solver shell
+//
+// Python-visible pybind11 class. Each Python NativeHairSolver instance
+// owns its baseline + reusable output buffer; there is no module-level
+// global solver state. Multiple instances can coexist if a future phase
+// needs that. Deformation matches Phase 6A:
+//   output[i].z = baseline[i].z + (i % pps) / (pps - 1) * amp
+//   amp        = sin((frame - 800) * 0.15) * 0.25
+// so existing regression points (frame 800 baseline, 805 / 815 / 840
+// deterministic offsets) still hold bit-for-bit.
+//
+// Lifecycle:
+//   __init__         -> closed=true, initialized=false
+//   initialize(...)  -> baseline copy, allocates output buffer
+//   step(frame)      -> writes output buffer, returns py::bytes
+//   reset()          -> writes baseline into output buffer, step_count=0
+//   status()         -> dict snapshot
+//   close()          -> releases buffers, returns to closed=true
+//
+// Re-initialize while initialized: accepted; new baseline replaces old.
+// ---------------------------------------------------------------------- //
+
+class NativeHairSolver {
+public:
+    NativeHairSolver() = default;
+    ~NativeHairSolver() = default;
+
+    py::dict initialize(unsigned int point_count,
+                        unsigned int points_per_strand,
+                        py::buffer   baseline_buf);
+    py::dict step(int frame_current);
+    py::dict reset();
+    py::dict status() const;
+    py::dict close();
+
+private:
+    bool                m_initialized       = false;
+    bool                m_closed            = true;
+    unsigned int        m_point_count       = 0;
+    unsigned int        m_points_per_strand = 0;
+    unsigned int        m_strand_count      = 0;
+    std::vector<float>  m_baseline;       // owned copy of initial positions
+    std::vector<float>  m_last_result;    // reusable output buffer
+    int                 m_last_frame        = 0;
+    unsigned long long  m_step_count        = 0ULL;
+    std::string         m_last_message;
+
+    // Phase 6B deformation params (same as Phase 6A).
+    static constexpr int   kAnimFrameOrigin   = 800;
+    static constexpr float kAnimFreqPerFrame  = 0.15f;
+    static constexpr float kAnimAmplitude     = 0.25f;
+};
+
+py::dict NativeHairSolver::initialize(unsigned int point_count,
+                                       unsigned int points_per_strand,
+                                       py::buffer   baseline_buf)
+{
+    py::dict d;
+    d["point_count"]       = point_count;
+    d["points_per_strand"] = points_per_strand;
+
+    if (point_count == 0u || points_per_strand < 2u
+        || (point_count % points_per_strand) != 0u) {
+        d["accepted"]    = false;
+        d["initialized"] = m_initialized;
+        d["message"]     = "rejected: point_count > 0, points_per_strand >= 2, point_count % pps == 0";
+        return d;
+    }
+
+    py::buffer_info info = baseline_buf.request(/*writable=*/false);
+    if (info.itemsize != static_cast<py::ssize_t>(sizeof(float))
+        || info.format != py::format_descriptor<float>::format()
+        || info.size != static_cast<py::ssize_t>(point_count * 3u)) {
+        d["accepted"]              = false;
+        d["initialized"]           = m_initialized;
+        d["baseline_buf_itemsize"] = static_cast<int>(info.itemsize);
+        d["baseline_buf_format"]   = info.format;
+        d["baseline_buf_size"]     = static_cast<long long>(info.size);
+        d["message"]               = "rejected: baseline_buf must be float32 length point_count*3";
+        return d;
+    }
+
+    const float* p = static_cast<const float*>(info.ptr);
+    const std::size_t n_floats = static_cast<std::size_t>(point_count) * 3u;
+
+    m_baseline.assign(p, p + n_floats);
+    m_last_result.assign(n_floats, 0.0f);
+    m_point_count        = point_count;
+    m_points_per_strand  = points_per_strand;
+    m_strand_count       = point_count / points_per_strand;
+    m_last_frame         = 0;
+    m_step_count         = 0;
+    m_initialized        = true;
+    m_closed             = false;
+    m_last_message       = "initialized";
+
+    d["accepted"]          = true;
+    d["initialized"]       = true;
+    d["closed"]            = false;
+    d["point_count"]       = m_point_count;
+    d["float_count"]       = static_cast<unsigned int>(n_floats);
+    d["points_per_strand"] = m_points_per_strand;
+    d["strand_count"]      = m_strand_count;
+    d["baseline_owned"]    = true;
+    d["message"]           = "NativeHairSolver initialized";
+    return d;
+}
+
+py::dict NativeHairSolver::step(int frame_current)
+{
+    py::dict d;
+    d["frame_current"] = frame_current;
+
+    if (!m_initialized || m_closed) {
+        d["accepted"]    = false;
+        d["initialized"] = m_initialized;
+        d["closed"]      = m_closed;
+        d["message"]     = "rejected: solver not initialized";
+        return d;
+    }
+
+    const float amp = std::sin((static_cast<float>(frame_current) - static_cast<float>(kAnimFrameOrigin))
+                                * kAnimFreqPerFrame) * kAnimAmplitude;
+    const std::size_t pps     = static_cast<std::size_t>(m_points_per_strand);
+    const float       inv_max = 1.0f / static_cast<float>(pps - 1u);
+    const std::size_t n       = static_cast<std::size_t>(m_point_count);
+
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::size_t idx_in_strand = i % pps;
+        const float       factor        = static_cast<float>(idx_in_strand) * inv_max;
+        const float       dz            = factor * amp;
+        const std::size_t base          = i * 3u;
+        m_last_result[base + 0] = m_baseline[base + 0];
+        m_last_result[base + 1] = m_baseline[base + 1];
+        m_last_result[base + 2] = m_baseline[base + 2] + dz;
+    }
+
+    m_step_count   += 1ULL;
+    m_last_frame    = frame_current;
+    m_last_message  = "step ok";
+
+    d["accepted"]      = true;
+    d["step_count"]    = m_step_count;
+    d["amplitude"]     = amp;
+    d["float_count"]   = static_cast<unsigned int>(m_last_result.size());
+    d["result_buffer"] = py::bytes(
+        reinterpret_cast<const char*>(m_last_result.data()),
+        static_cast<py::ssize_t>(m_last_result.size() * sizeof(float)));
+    d["message"]       = "step ok";
+    return d;
+}
+
+py::dict NativeHairSolver::reset()
+{
+    py::dict d;
+    if (!m_initialized || m_closed) {
+        d["accepted"] = false;
+        d["message"]  = "rejected: solver not initialized";
+        return d;
+    }
+    // Copy baseline into output so the caller can write baseline to Curves
+    // via the same result_buffer path used by step().
+    m_last_result.assign(m_baseline.begin(), m_baseline.end());
+    m_step_count   = 0;
+    m_last_frame   = 0;
+    m_last_message = "reset to baseline";
+
+    d["accepted"]      = true;
+    d["step_count"]    = m_step_count;
+    d["float_count"]   = static_cast<unsigned int>(m_last_result.size());
+    d["result_buffer"] = py::bytes(
+        reinterpret_cast<const char*>(m_last_result.data()),
+        static_cast<py::ssize_t>(m_last_result.size() * sizeof(float)));
+    d["message"]       = "reset to baseline";
+    return d;
+}
+
+py::dict NativeHairSolver::status() const
+{
+    py::dict d;
+    d["initialized"]        = m_initialized;
+    d["closed"]             = m_closed;
+    d["point_count"]        = m_point_count;
+    d["float_count"]        = m_point_count * 3u;
+    d["points_per_strand"]  = m_points_per_strand;
+    d["strand_count"]       = m_strand_count;
+    d["baseline_owned"]     = !m_baseline.empty();
+    d["last_frame"]         = m_last_frame;
+    d["step_count"]         = m_step_count;
+    d["last_message"]       = m_last_message;
+    d["message"]            = m_initialized
+        ? (m_closed ? "solver closed" : "solver active")
+        : "solver not initialized";
+    return d;
+}
+
+py::dict NativeHairSolver::close()
+{
+    py::dict d;
+    if (!m_initialized && m_closed) {
+        d["accepted"]       = true;
+        d["already_closed"] = true;
+        d["initialized"]    = false;
+        d["closed"]         = true;
+        d["message"]        = "solver already closed";
+        return d;
+    }
+
+    m_baseline.clear();
+    m_baseline.shrink_to_fit();
+    m_last_result.clear();
+    m_last_result.shrink_to_fit();
+    m_initialized        = false;
+    m_closed             = true;
+    m_point_count        = 0;
+    m_points_per_strand  = 0;
+    m_strand_count       = 0;
+    m_last_frame         = 0;
+    m_step_count         = 0;
+    m_last_message       = "closed";
+
+    d["accepted"]       = true;
+    d["already_closed"] = false;
+    d["initialized"]    = false;
+    d["closed"]         = true;
+    d["message"]        = "NativeHairSolver closed";
+    return d;
+}
+
 PYBIND11_MODULE(phase2b_probe, m) {
     m.attr("phase") = "2B";
     m.def("add", &add);
@@ -1946,6 +2182,18 @@ PYBIND11_MODULE(phase2b_probe, m) {
     m.def("physx_gpu_probe_step",   &physx_gpu_probe_step,
           py::arg("dt"));
     m.def("physx_gpu_probe_close",  &physx_gpu_probe_close);
+
+    // Phase 6B: stateful native hair solver shell (pybind11 class).
+    py::class_<NativeHairSolver>(m, "NativeHairSolver")
+        .def(py::init<>())
+        .def("initialize", &NativeHairSolver::initialize,
+             py::arg("point_count"),
+             py::arg("points_per_strand"),
+             py::arg("baseline_buf"))
+        .def("step",   &NativeHairSolver::step,   py::arg("frame_current"))
+        .def("reset",  &NativeHairSolver::reset)
+        .def("status", &NativeHairSolver::status)
+        .def("close",  &NativeHairSolver::close);
 
     // Phase 5H: CPU vs GPU rigid-grid benchmark (self-contained per call).
     m.def("physx_benchmark_rigid_grid_cpu", &physx_benchmark_rigid_grid_cpu,

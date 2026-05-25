@@ -1,20 +1,27 @@
-"""Hair Simulation — Phase 6A.
+"""Hair Simulation — Phase 6B.
 
-First implementation phase: the Phase 1 SolverInterface stub is now
-wired to the C++ deterministic deformation path (Phase 4C's
-deform_position_buffer). Canonical round-trip is Phase 4D2's:
-original Curves baseline -> Python buffer -> C++ deform -> result ->
-original Curves -> update_tag. No PhysX, no CUDA, no collision yet.
+First real solver architecture step. SolverInterface now owns a
+stateful native solver instance (`NativeHairSolver`, a pybind11 class
+in the native module) instead of calling a stateless C++ helper. The
+native solver stores the baseline and a reusable output buffer; the
+visible deformation (frame 800 baseline, 805/815/840 deterministic
+offsets) matches Phase 6A exactly.
+
+Canonical round-trip is still Phase 4D2's: original Curves baseline ->
+NativeHairSolver -> result_buffer -> original Curves -> update_tag.
+No PhysX, no CUDA, no collision yet.
 
 Phase 1 invariants preserved: a single persistent frame_change_post
 handler gated by WindowManager.hair_sim_running, Start/Stop/Reset
 operators. Reset does NOT change running state (spec). Start failure
 keeps hair_sim_running=False (no silent running-but-no-op state).
+Restart behavior: each successful Start re-instantiates a fresh
+NativeHairSolver and re-captures baseline from current original Curves
+(so Stop -> Reset -> Start gives a clean cycle).
 """
 from __future__ import annotations
 
 import array
-import math
 
 import bpy
 from bpy.app.handlers import persistent
@@ -29,45 +36,40 @@ from . import ui
 # --------------------------------------------------------------------------- #
 
 class SolverInterface:
-    """Phase 6A implementation. Drives a deterministic, non-cumulative
-    C++ deformation of one hard-coded Curves object's ORIGINAL position
-    attribute every frame_change_post.
-
-    Hard-coded target is acceptable for Phase 6A; object discovery is
-    a later phase. The deformation is computed from a baseline that is
-    captured exactly once per Start, so step() is independent of any
-    previously written result (non-cumulative)."""
+    """Phase 6B implementation. Holds a stateful native solver instance
+    (`NativeHairSolver`, a pybind11 class) for the lifetime of the
+    Python solver. step() delegates to `_native_solver.step(frame)`,
+    which returns a `result_buffer` (py::bytes) computed from the
+    baseline that the native solver captured at initialize time."""
 
     # Phase 6A hard-coded target (YOKO_EXT_TEST.blend).
-    _TARGET_OBJECT_NAME  = "カーブ.001"  # "カーブ.001"
+    _TARGET_OBJECT_NAME  = "カーブ.001"
     _POINTS_PER_STRAND   = 8
     _ATTRIBUTE_NAME      = "position"
     _ATTRIBUTE_FIELD     = "vector"     # foreach key for FLOAT_VECTOR
-    _ANIM_FRAME_ORIGIN   = 800
-    _ANIM_FREQ_PER_FRAME = 0.15         # radians per frame
-    _ANIM_AMPLITUDE      = 0.25         # in baseline units (Blender world ~m)
 
     def __init__(self) -> None:
-        self._native             = None
-        self._baseline           = None   # array.array('f') length = n_points * 3
+        self._native             = None    # native module ref (for hasattr checks)
+        self._native_solver      = None    # NativeHairSolver instance
         self._n_points           = 0
         self._step_error_active  = False
 
     # ---- lifecycle ----
 
     def start(self) -> bool:
-        """Acquire native module and capture baseline. Returns True only
-        on success; on failure the operator must leave hair_sim_running
+        """Acquire native module, capture baseline, and instantiate +
+        initialize a fresh NativeHairSolver. Returns True only on
+        success; on failure the operator must leave hair_sim_running
         as False so step() never gets called silently."""
         self._step_error_active = False
-        self._native   = None
-        self._baseline = None
-        self._n_points = 0
+        self._native        = None
+        self._native_solver = None
+        self._n_points      = 0
 
         from . import _native_loader
         native = _native_loader.get_native()
-        if native is None or not hasattr(native, "deform_position_buffer"):
-            print("[hair_sim] start failed: native module / deform_position_buffer unavailable")
+        if native is None or not hasattr(native, "NativeHairSolver"):
+            print("[hair_sim] start failed: native module / NativeHairSolver class unavailable")
             return False
 
         obj = bpy.data.objects.get(self._TARGET_OBJECT_NAME)
@@ -90,32 +92,64 @@ class SolverInterface:
         baseline = array.array('f', [0.0] * (n_points * 3))
         pos.data.foreach_get(self._ATTRIBUTE_FIELD, baseline)
 
-        self._native   = native
-        self._baseline = baseline
-        self._n_points = n_points
-        print(f"[hair_sim] start: captured baseline "
-              f"({n_points} points / {n_points // self._POINTS_PER_STRAND} strands)")
+        try:
+            solver = native.NativeHairSolver()
+            init_r = solver.initialize(
+                point_count=n_points,
+                points_per_strand=self._POINTS_PER_STRAND,
+                baseline_buf=baseline,
+            )
+        except Exception as exc:
+            print(f"[hair_sim] start failed: NativeHairSolver construct/initialize raised: {exc!r}")
+            return False
+
+        if not init_r.get("accepted") or not init_r.get("initialized"):
+            print(f"[hair_sim] start failed: NativeHairSolver.initialize rejected: "
+                  f"{init_r.get('message')!r}")
+            return False
+
+        self._native        = native
+        self._native_solver = solver
+        self._n_points      = n_points
+        print(f"[hair_sim] start: NativeHairSolver init ok "
+              f"(point_count={init_r.get('point_count')}, "
+              f"strand_count={init_r.get('strand_count')}, "
+              f"points_per_strand={init_r.get('points_per_strand')})")
         return True
 
     def stop(self) -> None:
-        """Spec: Stop does not touch baseline (so Reset-after-Stop still
-        works) and does not flip hair_sim_running (the operator owns
-        that). Step() naturally stops being called once running=False."""
+        """Spec: Stop does not destroy the native solver and does not flip
+        hair_sim_running (the operator owns that). The native solver
+        keeps its baseline so Reset-after-Stop still restores cleanly."""
         return None
 
     def reset(self) -> None:
-        """Spec: Reset restores original Curves to the captured baseline
-        when one exists. Does NOT change hair_sim_running. Without a
-        captured baseline this is a no-op."""
-        if self._baseline is None:
+        """Spec: Reset restores original Curves to the captured baseline.
+        Does NOT change hair_sim_running. If no solver is initialized
+        this is a no-op."""
+        if self._native_solver is None:
+            return
+        try:
+            r = self._native_solver.reset()
+        except Exception as exc:
+            print(f"[hair_sim] reset error: {exc!r}")
+            return
+        if not r.get("accepted"):
+            return
+        result_bytes = r.get("result_buffer")
+        if not result_bytes:
+            return
+        buf = array.array('f')
+        buf.frombytes(result_bytes)
+        if len(buf) != self._n_points * 3:
             return
         obj = bpy.data.objects.get(self._TARGET_OBJECT_NAME)
-        if obj is None or obj.type != "CURVES":
+        if obj is None:
             return
         attr = obj.data.attributes.get(self._ATTRIBUTE_NAME)
         if attr is None or len(attr.data) != self._n_points:
             return
-        attr.data.foreach_set(self._ATTRIBUTE_FIELD, self._baseline)
+        attr.data.foreach_set(self._ATTRIBUTE_FIELD, buf)
         obj.data.update_tag()
 
     # ---- per-frame ----
@@ -123,23 +157,12 @@ class SolverInterface:
     def step(self, scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> None:
         if self._step_error_active:
             return
-        if self._native is None or self._baseline is None:
+        if self._native_solver is None:
             return
         try:
-            frame = scene.frame_current
-            amp = math.sin((frame - self._ANIM_FRAME_ORIGIN)
-                            * self._ANIM_FREQ_PER_FRAME) * self._ANIM_AMPLITUDE
-
-            r = self._native.deform_position_buffer(
-                expected_point_count=self._n_points,
-                expected_float_count=self._n_points * 3,
-                points_per_strand=self._POINTS_PER_STRAND,
-                frame_current=frame,
-                amplitude=float(amp),
-                input_buf=self._baseline,        # non-cumulative input every step
-            )
+            r = self._native_solver.step(frame_current=int(scene.frame_current))
             if not r.get("accepted"):
-                return  # C++ validation rejected; do not corrupt curves
+                return
             result_bytes = r.get("result_buffer")
             if not result_bytes:
                 return
