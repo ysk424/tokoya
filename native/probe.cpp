@@ -1,6 +1,6 @@
-// Phase 2B/4A/4B/4C/5A/5B/5C/5D/5E/5G/5H/6B placeholder module. Module
-// name, function names, and phase attribute are experimental and will
-// change before any real solver wiring.
+// Phase 2B/4A/4B/4C/5A/5B/5C/5D/5E/5G/5H/6B/6C placeholder module.
+// Module name, function names, and phase attribute are experimental
+// and will change before any real solver wiring.
 //
 // Phase history of this file:
 //   4A: describe_curves           (metadata round-trip only)
@@ -45,6 +45,11 @@
 //                                  deformation same as Phase 6A; first
 //                                  real solver architecture step — still
 //                                  no PhysX, no collision, no GPU)
+//   6C: NativeHairSolver gets minimal CPU physics
+//                                 (Verlet integration + distance constraint
+//                                  + fixed roots + gravity along -Z in
+//                                  Curves local space; first real physics
+//                                  state; still no PhysX, no collision)
 #include <pybind11/pybind11.h>
 
 #include <PxPhysicsAPI.h>
@@ -1935,22 +1940,164 @@ public:
     py::dict close();
 
 private:
-    bool                m_initialized       = false;
-    bool                m_closed            = true;
-    unsigned int        m_point_count       = 0;
-    unsigned int        m_points_per_strand = 0;
-    unsigned int        m_strand_count      = 0;
-    std::vector<float>  m_baseline;       // owned copy of initial positions
-    std::vector<float>  m_last_result;    // reusable output buffer
-    int                 m_last_frame        = 0;
-    unsigned long long  m_step_count        = 0ULL;
-    std::string         m_last_message;
+    // Phase 6C tunables (kept inside the class so callers can read them
+    // via status() but can't change them mid-run).
+    static constexpr float kDt                    = 1.0f / 60.0f;
+    static constexpr float kGravityX              = 0.0f;
+    static constexpr float kGravityY              = 0.0f;
+    static constexpr float kGravityZ              = -2.0f;   // negative Z in Curves local
+    static constexpr float kVelocityDamping       = 0.02f;   // per-step drag (Verlet)
+    static constexpr unsigned int kConstraintIters= 4u;
 
-    // Phase 6B deformation params (same as Phase 6A).
-    static constexpr int   kAnimFrameOrigin   = 800;
-    static constexpr float kAnimFreqPerFrame  = 0.15f;
-    static constexpr float kAnimAmplitude     = 0.25f;
+    // Reset Verlet state to baseline (no allocations).
+    void _reset_physics_state_to_baseline();
+    // One physics step: Verlet integrate then constraint projection.
+    void _verlet_integrate();
+    void _apply_distance_constraints();
+    // Recompute max |current - baseline| across all points.
+    float _compute_max_displacement() const;
+    // Build rest_lengths from baseline.
+    void _rebuild_rest_lengths();
+
+    bool                m_initialized        = false;
+    bool                m_closed             = true;
+    bool                m_physics_initialized= false;
+    unsigned int        m_point_count        = 0;
+    unsigned int        m_points_per_strand  = 0;
+    unsigned int        m_strand_count       = 0;
+    std::vector<float>  m_baseline;          // initial positions (n_points*3 floats)
+    std::vector<float>  m_current;           // current positions
+    std::vector<float>  m_previous;          // Verlet previous positions
+    std::vector<float>  m_rest_lengths;      // strand_count * (pps-1) floats
+    int                 m_last_frame         = 0;
+    unsigned long long  m_step_count         = 0ULL;
+    float               m_max_disp_last      = 0.0f;
+    std::string         m_last_message;
 };
+
+void NativeHairSolver::_rebuild_rest_lengths()
+{
+    const unsigned int pps = m_points_per_strand;
+    if (pps < 2u) { m_rest_lengths.clear(); return; }
+    const unsigned int per_strand = pps - 1u;
+    m_rest_lengths.assign(static_cast<std::size_t>(m_strand_count) * per_strand, 0.0f);
+    for (unsigned int s = 0; s < m_strand_count; ++s) {
+        const unsigned int base = s * pps;
+        for (unsigned int k = 1; k < pps; ++k) {
+            const unsigned int i = base + (k - 1u);
+            const unsigned int j = base + k;
+            const float dx = m_baseline[j*3u + 0] - m_baseline[i*3u + 0];
+            const float dy = m_baseline[j*3u + 1] - m_baseline[i*3u + 1];
+            const float dz = m_baseline[j*3u + 2] - m_baseline[i*3u + 2];
+            const float L  = std::sqrt(dx*dx + dy*dy + dz*dz);
+            m_rest_lengths[static_cast<std::size_t>(s) * per_strand + (k - 1u)] = L;
+        }
+    }
+}
+
+void NativeHairSolver::_reset_physics_state_to_baseline()
+{
+    m_current  = m_baseline;
+    m_previous = m_baseline;
+    m_max_disp_last = 0.0f;
+}
+
+void NativeHairSolver::_verlet_integrate()
+{
+    const float ax_dt2 = kGravityX * kDt * kDt;
+    const float ay_dt2 = kGravityY * kDt * kDt;
+    const float az_dt2 = kGravityZ * kDt * kDt;
+    const float drag   = 1.0f - kVelocityDamping;
+    const unsigned int pps = m_points_per_strand;
+    const std::size_t n    = static_cast<std::size_t>(m_point_count);
+
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::size_t base = i * 3u;
+        if ((static_cast<unsigned int>(i) % pps) == 0u) {
+            // fixed root: snap to baseline (and pin Verlet history there too
+            // so it can't drift in via a one-cycle aliasing).
+            m_current[base + 0] = m_baseline[base + 0];
+            m_current[base + 1] = m_baseline[base + 1];
+            m_current[base + 2] = m_baseline[base + 2];
+            m_previous[base + 0] = m_baseline[base + 0];
+            m_previous[base + 1] = m_baseline[base + 1];
+            m_previous[base + 2] = m_baseline[base + 2];
+            continue;
+        }
+        const float px = m_current[base + 0];
+        const float py = m_current[base + 1];
+        const float pz = m_current[base + 2];
+        const float vx = (px - m_previous[base + 0]) * drag;
+        const float vy = (py - m_previous[base + 1]) * drag;
+        const float vz = (pz - m_previous[base + 2]) * drag;
+        m_previous[base + 0] = px;
+        m_previous[base + 1] = py;
+        m_previous[base + 2] = pz;
+        m_current[base + 0] = px + vx + ax_dt2;
+        m_current[base + 1] = py + vy + ay_dt2;
+        m_current[base + 2] = pz + vz + az_dt2;
+    }
+}
+
+void NativeHairSolver::_apply_distance_constraints()
+{
+    const unsigned int pps = m_points_per_strand;
+    if (pps < 2u) return;
+    const unsigned int per_strand = pps - 1u;
+
+    for (unsigned int iter = 0; iter < kConstraintIters; ++iter) {
+        for (unsigned int s = 0; s < m_strand_count; ++s) {
+            const unsigned int base = s * pps;
+            for (unsigned int k = 1; k < pps; ++k) {
+                const unsigned int i = base + (k - 1u);
+                const unsigned int j = base + k;
+                const bool i_fixed = (k == 1u);  // i is the root only when k==1
+                float* pi = &m_current[i * 3u];
+                float* pj = &m_current[j * 3u];
+                const float dx = pj[0] - pi[0];
+                const float dy = pj[1] - pi[1];
+                const float dz = pj[2] - pi[2];
+                const float curlen = std::sqrt(dx*dx + dy*dy + dz*dz);
+                if (curlen < 1e-12f) continue;
+                const float rest = m_rest_lengths[
+                    static_cast<std::size_t>(s) * per_strand + (k - 1u)];
+                const float inv = 1.0f / curlen;
+                const float err = curlen - rest;
+                if (i_fixed) {
+                    // root is pinned; move only j toward i
+                    const float t = err * inv;
+                    pj[0] -= t * dx;
+                    pj[1] -= t * dy;
+                    pj[2] -= t * dz;
+                } else {
+                    // distribute correction halfway
+                    const float t = 0.5f * err * inv;
+                    pi[0] += t * dx;
+                    pi[1] += t * dy;
+                    pi[2] += t * dz;
+                    pj[0] -= t * dx;
+                    pj[1] -= t * dy;
+                    pj[2] -= t * dz;
+                }
+            }
+        }
+    }
+}
+
+float NativeHairSolver::_compute_max_displacement() const
+{
+    float maxd2 = 0.0f;
+    const std::size_t n = static_cast<std::size_t>(m_point_count);
+    for (std::size_t i = 0; i < n; ++i) {
+        const std::size_t base = i * 3u;
+        const float dx = m_current[base + 0] - m_baseline[base + 0];
+        const float dy = m_current[base + 1] - m_baseline[base + 1];
+        const float dz = m_current[base + 2] - m_baseline[base + 2];
+        const float d2 = dx*dx + dy*dy + dz*dz;
+        if (d2 > maxd2) maxd2 = d2;
+    }
+    return std::sqrt(maxd2);
+}
 
 py::dict NativeHairSolver::initialize(unsigned int point_count,
                                        unsigned int points_per_strand,
@@ -1962,9 +2109,10 @@ py::dict NativeHairSolver::initialize(unsigned int point_count,
 
     if (point_count == 0u || points_per_strand < 2u
         || (point_count % points_per_strand) != 0u) {
-        d["accepted"]    = false;
-        d["initialized"] = m_initialized;
-        d["message"]     = "rejected: point_count > 0, points_per_strand >= 2, point_count % pps == 0";
+        d["accepted"]            = false;
+        d["initialized"]         = m_initialized;
+        d["physics_initialized"] = m_physics_initialized;
+        d["message"]             = "rejected: point_count > 0, points_per_strand >= 2, point_count % pps == 0";
         return d;
     }
 
@@ -1974,6 +2122,7 @@ py::dict NativeHairSolver::initialize(unsigned int point_count,
         || info.size != static_cast<py::ssize_t>(point_count * 3u)) {
         d["accepted"]              = false;
         d["initialized"]           = m_initialized;
+        d["physics_initialized"]   = m_physics_initialized;
         d["baseline_buf_itemsize"] = static_cast<int>(info.itemsize);
         d["baseline_buf_format"]   = info.format;
         d["baseline_buf_size"]     = static_cast<long long>(info.size);
@@ -1985,25 +2134,34 @@ py::dict NativeHairSolver::initialize(unsigned int point_count,
     const std::size_t n_floats = static_cast<std::size_t>(point_count) * 3u;
 
     m_baseline.assign(p, p + n_floats);
-    m_last_result.assign(n_floats, 0.0f);
+    m_current.assign(p, p + n_floats);
+    m_previous.assign(p, p + n_floats);
     m_point_count        = point_count;
     m_points_per_strand  = points_per_strand;
     m_strand_count       = point_count / points_per_strand;
+    _rebuild_rest_lengths();
     m_last_frame         = 0;
     m_step_count         = 0;
+    m_max_disp_last      = 0.0f;
     m_initialized        = true;
     m_closed             = false;
+    m_physics_initialized= true;
     m_last_message       = "initialized";
 
-    d["accepted"]          = true;
-    d["initialized"]       = true;
-    d["closed"]            = false;
-    d["point_count"]       = m_point_count;
-    d["float_count"]       = static_cast<unsigned int>(n_floats);
-    d["points_per_strand"] = m_points_per_strand;
-    d["strand_count"]      = m_strand_count;
-    d["baseline_owned"]    = true;
-    d["message"]           = "NativeHairSolver initialized";
+    d["accepted"]            = true;
+    d["initialized"]         = true;
+    d["physics_initialized"] = true;
+    d["closed"]              = false;
+    d["point_count"]         = m_point_count;
+    d["float_count"]         = static_cast<unsigned int>(n_floats);
+    d["points_per_strand"]   = m_points_per_strand;
+    d["strand_count"]        = m_strand_count;
+    d["baseline_owned"]      = true;
+    d["constraint_iterations"]= kConstraintIters;
+    d["gravity"]             = py::make_tuple(kGravityX, kGravityY, kGravityZ);
+    d["dt"]                  = kDt;
+    d["velocity_damping"]    = kVelocityDamping;
+    d["message"]             = "NativeHairSolver initialized (Verlet physics state ready)";
     return d;
 }
 
@@ -2012,41 +2170,42 @@ py::dict NativeHairSolver::step(int frame_current)
     py::dict d;
     d["frame_current"] = frame_current;
 
-    if (!m_initialized || m_closed) {
-        d["accepted"]    = false;
-        d["initialized"] = m_initialized;
-        d["closed"]      = m_closed;
-        d["message"]     = "rejected: solver not initialized";
+    if (!m_initialized || m_closed || !m_physics_initialized) {
+        d["accepted"]            = false;
+        d["initialized"]         = m_initialized;
+        d["physics_initialized"] = m_physics_initialized;
+        d["closed"]              = m_closed;
+        d["message"]             = "rejected: solver not initialized / physics state missing";
         return d;
     }
 
-    const float amp = std::sin((static_cast<float>(frame_current) - static_cast<float>(kAnimFrameOrigin))
-                                * kAnimFreqPerFrame) * kAnimAmplitude;
-    const std::size_t pps     = static_cast<std::size_t>(m_points_per_strand);
-    const float       inv_max = 1.0f / static_cast<float>(pps - 1u);
-    const std::size_t n       = static_cast<std::size_t>(m_point_count);
-
-    for (std::size_t i = 0; i < n; ++i) {
-        const std::size_t idx_in_strand = i % pps;
-        const float       factor        = static_cast<float>(idx_in_strand) * inv_max;
-        const float       dz            = factor * amp;
-        const std::size_t base          = i * 3u;
-        m_last_result[base + 0] = m_baseline[base + 0];
-        m_last_result[base + 1] = m_baseline[base + 1];
-        m_last_result[base + 2] = m_baseline[base + 2] + dz;
+    // Backward jump: reset physics state to baseline before stepping.
+    // Forward jumps (including frame_current == last_frame) take one
+    // fixed-dt step regardless of frame delta. Same-frame revisits keep
+    // advancing the physics — Phase 6C explicitly drops the Phase 6A/6B
+    // same-frame bit-equality, this is documented in the spec.
+    bool did_backward_reset = false;
+    if (frame_current < m_last_frame) {
+        _reset_physics_state_to_baseline();
+        did_backward_reset = true;
     }
+
+    _verlet_integrate();
+    _apply_distance_constraints();
+    m_max_disp_last = _compute_max_displacement();
 
     m_step_count   += 1ULL;
     m_last_frame    = frame_current;
     m_last_message  = "step ok";
 
-    d["accepted"]      = true;
-    d["step_count"]    = m_step_count;
-    d["amplitude"]     = amp;
-    d["float_count"]   = static_cast<unsigned int>(m_last_result.size());
+    d["accepted"]                       = true;
+    d["step_count"]                     = m_step_count;
+    d["did_backward_reset"]             = did_backward_reset;
+    d["float_count"]                    = static_cast<unsigned int>(m_current.size());
+    d["max_displacement_from_baseline"] = m_max_disp_last;
     d["result_buffer"] = py::bytes(
-        reinterpret_cast<const char*>(m_last_result.data()),
-        static_cast<py::ssize_t>(m_last_result.size() * sizeof(float)));
+        reinterpret_cast<const char*>(m_current.data()),
+        static_cast<py::ssize_t>(m_current.size() * sizeof(float)));
     d["message"]       = "step ok";
     return d;
 }
@@ -2059,38 +2218,44 @@ py::dict NativeHairSolver::reset()
         d["message"]  = "rejected: solver not initialized";
         return d;
     }
-    // Copy baseline into output so the caller can write baseline to Curves
-    // via the same result_buffer path used by step().
-    m_last_result.assign(m_baseline.begin(), m_baseline.end());
-    m_step_count   = 0;
-    m_last_frame   = 0;
-    m_last_message = "reset to baseline";
+    _reset_physics_state_to_baseline();
+    m_step_count    = 0;
+    m_last_frame    = 0;
+    m_max_disp_last = 0.0f;
+    m_last_message  = "reset to baseline";
 
-    d["accepted"]      = true;
-    d["step_count"]    = m_step_count;
-    d["float_count"]   = static_cast<unsigned int>(m_last_result.size());
+    d["accepted"]                       = true;
+    d["step_count"]                     = m_step_count;
+    d["max_displacement_from_baseline"] = m_max_disp_last;
+    d["float_count"]                    = static_cast<unsigned int>(m_baseline.size());
     d["result_buffer"] = py::bytes(
-        reinterpret_cast<const char*>(m_last_result.data()),
-        static_cast<py::ssize_t>(m_last_result.size() * sizeof(float)));
-    d["message"]       = "reset to baseline";
+        reinterpret_cast<const char*>(m_baseline.data()),
+        static_cast<py::ssize_t>(m_baseline.size() * sizeof(float)));
+    d["message"]       = "reset: physics state -> baseline";
     return d;
 }
 
 py::dict NativeHairSolver::status() const
 {
     py::dict d;
-    d["initialized"]        = m_initialized;
-    d["closed"]             = m_closed;
-    d["point_count"]        = m_point_count;
-    d["float_count"]        = m_point_count * 3u;
-    d["points_per_strand"]  = m_points_per_strand;
-    d["strand_count"]       = m_strand_count;
-    d["baseline_owned"]     = !m_baseline.empty();
-    d["last_frame"]         = m_last_frame;
-    d["step_count"]         = m_step_count;
-    d["last_message"]       = m_last_message;
-    d["message"]            = m_initialized
-        ? (m_closed ? "solver closed" : "solver active")
+    d["initialized"]                    = m_initialized;
+    d["physics_initialized"]            = m_physics_initialized;
+    d["closed"]                         = m_closed;
+    d["point_count"]                    = m_point_count;
+    d["float_count"]                    = m_point_count * 3u;
+    d["points_per_strand"]              = m_points_per_strand;
+    d["strand_count"]                   = m_strand_count;
+    d["baseline_owned"]                 = !m_baseline.empty();
+    d["last_frame"]                     = m_last_frame;
+    d["step_count"]                     = m_step_count;
+    d["constraint_iterations"]          = kConstraintIters;
+    d["gravity"]                        = py::make_tuple(kGravityX, kGravityY, kGravityZ);
+    d["dt"]                             = kDt;
+    d["velocity_damping"]               = kVelocityDamping;
+    d["max_displacement_from_baseline"] = m_max_disp_last;
+    d["last_message"]                   = m_last_message;
+    d["message"]                        = m_initialized
+        ? (m_closed ? "solver closed" : "solver active (Verlet physics)")
         : "solver not initialized";
     return d;
 }
@@ -2099,32 +2264,36 @@ py::dict NativeHairSolver::close()
 {
     py::dict d;
     if (!m_initialized && m_closed) {
-        d["accepted"]       = true;
-        d["already_closed"] = true;
-        d["initialized"]    = false;
-        d["closed"]         = true;
-        d["message"]        = "solver already closed";
+        d["accepted"]            = true;
+        d["already_closed"]      = true;
+        d["initialized"]         = false;
+        d["physics_initialized"] = false;
+        d["closed"]              = true;
+        d["message"]             = "solver already closed";
         return d;
     }
 
-    m_baseline.clear();
-    m_baseline.shrink_to_fit();
-    m_last_result.clear();
-    m_last_result.shrink_to_fit();
+    m_baseline.clear();      m_baseline.shrink_to_fit();
+    m_current.clear();       m_current.shrink_to_fit();
+    m_previous.clear();      m_previous.shrink_to_fit();
+    m_rest_lengths.clear();  m_rest_lengths.shrink_to_fit();
     m_initialized        = false;
     m_closed             = true;
+    m_physics_initialized= false;
     m_point_count        = 0;
     m_points_per_strand  = 0;
     m_strand_count       = 0;
     m_last_frame         = 0;
     m_step_count         = 0;
+    m_max_disp_last      = 0.0f;
     m_last_message       = "closed";
 
-    d["accepted"]       = true;
-    d["already_closed"] = false;
-    d["initialized"]    = false;
-    d["closed"]         = true;
-    d["message"]        = "NativeHairSolver closed";
+    d["accepted"]            = true;
+    d["already_closed"]      = false;
+    d["initialized"]         = false;
+    d["physics_initialized"] = false;
+    d["closed"]              = true;
+    d["message"]             = "NativeHairSolver closed";
     return d;
 }
 
