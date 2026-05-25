@@ -19,6 +19,9 @@ dist/
 *.obj
 *.lib
 *.exp
+*.exe
+*.ilk
+*.pdb
 
 # PhysX runtime DLLs (copied next to .pyd at build time, NOT tracked)
 *.dll

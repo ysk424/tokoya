@@ -277,6 +277,62 @@ to isolate which unguarded allocation actually fires for our 4000
 anchor + 4000 child + 4000 springs configuration. **No in-Blender
 retry until that standalone probe disambiguates.**
 
+### Step 2 standalone probe result (PhysX direction closed)
+
+The standalone probe (`native/diag/arm_a_b_probe.cpp`) ran outside
+Blender and produced an unambiguous source-level conclusion:
+
+* Arm A Stage 1 (descriptor only, no GPU alloc):
+  `clothDesc.nbCloths=1, nbTriangles=0, nbSprings=4000, nbParticles=8000`,
+  `output.nbCloths=1, nbPartitions=8, nbSprings=4000, remapOutputSize=16000`.
+  Every count except `nbTriangles` is non-zero, ruling out the
+  "missing partitioned output" and "addCloth never called" candidates
+  that Desktop's source trace had listed.
+* Arm A Stage 2 (cloth buffer creation): emits **exactly one**
+  `PxgCudaMemoryAllocator.cpp(140): out of memory: failed to
+  allocate memory 0 bytes! Result = 1`, then returns a non-null
+  cloth-buffer pointer with `contextIsValid() == 1`. The simulate-
+  time abort chain (`NpScene.cpp(3036)`, `EXCEPTION_ACCESS_VIOLATION`
+  in `PhysX_64.dll`) does not fire here because the standalone exe
+  doesn't call `simulate()`; the exit code is non-zero on process
+  teardown, but no Blender process is at risk.
+* Arm B Stage 2 (all counts zero) also emits **exactly one** identical
+  error message. If multiple unguarded allocations in `setCloths`
+  were the cause, Arm B would emit several — it does not.
+* Conclusion: the single 0-byte CUDA allocation is inside
+  `PxgParticleClothBuffer`'s constructor, sized by
+  `clothDesc.nbTriangles` (which `PxCreateAndPopulateParticleClothBuffer`
+  passes to the constructor as `maxNumTriangles`). The helper's
+  `maxTriangles` parameter does **not** participate in this path.
+  Desktop's section D2 conjecture (that `maxTriangles=1000` would
+  satisfy the constructor) was wrong on this specific point.
+* **Hard structural finding**: `clothDesc.nbTriangles >= 1` is a
+  silent precondition of the cloth-buffer construction in PhysX
+  5.6.1. Spring-only configurations (no triangles at all) cannot be
+  expressed through this API. Avoiding dummy-triangle injection
+  therefore closes the cloth-buffer route entirely for the
+  hair-strand use case.
+
+### Direction change after Step 2: PhysX PBD path is stopped
+
+The Phase 7 PhysX-PBD-particle direction is **stopped**. The
+deprecated cloth-buffer API is the only PhysX 5.6.1 surface that
+exposes particle-particle distance constraints, and the source-level
+investigation above shows it cannot be used in a spring-only hair
+configuration without injecting fake triangle data — which was
+explicitly forbidden during scoping ("前処理で抑えない").
+
+The project continues from the working baseline at and including
+Phase 6C (commit `79a9fb3`). The native solver shell, the original
+→ C++ → original round-trip, and the Start/Stop/Reset lifecycle are
+all retained. The next phase line moves to **NVIDIA Warp** as the
+GPU compute backend; see the Phase 7W history rows once those
+commits land. The Phase 7A-1 anchor-only PBD commit (`c0ed932`)
+remains in the history as a record of the API surface that was
+explored, but is not the active path forward. The standalone
+`native/diag/` exe is kept as the reproducible evidence behind this
+decision, not as a probe that will run again.
+
 ---
 
 ## Phase 5H benchmark headline (CPU vs GPU rigid grid)
