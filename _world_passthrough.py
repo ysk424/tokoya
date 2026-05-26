@@ -117,15 +117,19 @@ VBD_FREE_PARTICLE_MASS = 1.0     # mass for non-root particles
 VBD_GRAVITY            = -9.81   # m/s² along the up-axis (Z down)
 VBD_ITERATIONS         = 8       # VBD solver iterations per step
 
-# Self-contact (particle-particle collision). Newton's SolverVBD has this
-# OFF by default; for densely-packed curves like hair, that lets strands
-# pass through each other and the energy of overlapping particles blows up
-# (matches the "no self-collision = explosion" experience from Houdini).
-# Default radius/margin (0.2 m) is way too big for hair points spaced
-# at a few cm; use small values appropriate to per-point spacing.
-VBD_SELF_CONTACT_ENABLED = True
-VBD_SELF_CONTACT_RADIUS  = 0.005   # 5 mm per particle
-VBD_SELF_CONTACT_MARGIN  = 0.005   # 5 mm collision-search margin
+# Self-contact (particle-particle collision). Newton's SolverVBD has
+# this OFF by default. We attempted to enable it at alpha-confirmed
+# (commit fde65e0, v0.0.36) and found that SolverVBD's self-contact
+# code path requires triangles in the model: the constructor accesses
+# `particle_vertex_triangle_contact_filtering_list` which is only
+# populated by `_compute_particle_contact_filtering_list` when
+# `model.tri_count > 0`. Our spring-only hair model has zero triangles
+# → AttributeError → build fails. KEPT OFF on this branch so VBD
+# actually initializes; particle-particle conflict is left to bending
+# constraints + careful tuning to manage.
+VBD_SELF_CONTACT_ENABLED = False
+VBD_SELF_CONTACT_RADIUS  = 0.005   # unused while disabled
+VBD_SELF_CONTACT_MARGIN  = 0.005   # unused while disabled
 # Newton 1.2.0 / Warp 1.13.0 on RTX 5070 Ti (sm_120 Blackwell):
 # `cuda:0` finalize() succeeds but step() triggers "CUDA error 700:
 # illegal memory access" mid-kernel, which corrupts the CUDA context
