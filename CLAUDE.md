@@ -5,12 +5,89 @@ Treat it as a living context document, updated when phases close.
 
 ---
 
-## ⚠️ START HERE — Direction change to VBD (2026-05-25 PM)
+## ⚠️ START HERE — v0.0.54 working milestone (2026-05-26 evening)
 
-**The active branch is now `vbd-direction`, not `main`.** Run
-`git branch` and check the asterisk. If you find yourself on `main`
-by mistake, the project's direction has changed and `main`'s HEAD
-(7e7f63a, Phase 7W-G) is no longer the working line.
+**Active branch: `vbd-features-applied`** (NOT `vbd-direction`, NOT
+`main`). HEAD = `6a7742e` "VBD milestone v0.0.54". Run `git branch`
+to verify the asterisk. The bundled extension `dist/hair_sim_physx-
+0.0.54.zip` is the user-validated working build as of this entry.
+
+### What landed in v0.0.54
+
+1. **Research parameter panel**: `hair_sim_defaults.json` provides
+   initial values, 12 WindowManager properties (SKIP_SAVE) expose
+   spring/bend/mass/iter/substep/collision knobs in the HairSim
+   N-panel. Values snapshot into `_world_passthrough` constants at
+   each Start. Marked for production removal (search
+   `REMOVE FOR PRODUCTION` in `__init__.py` and `ui.py`). JSON is
+   ABEND-on-missing per user spec (no fallback). MCP can write
+   `bpy.context.window_manager.hair_sim_param_<name>` directly.
+
+2. **Velocity-driven kinematic root** in `_run_one_simulation_step`:
+   - `in_qd[root] = (eval_world[root] - prev_root) / dt`
+   - Per-substep manual advance: `q[root] += V * dt_sub`,
+     `qd[root]` re-injected (Newton's VBD does NOT integrate mass=0
+     via `x += v*dt`; verified by in-session standalone probe).
+   - Replaces the prior `in_q[root] = NEW + qd[root] = 0` design
+     that injected time-inconsistent state and accumulated error.
+
+3. **SIM ↔ PLAYBACK consistency fix**: `_restore_from_bake` now
+   applies the same SD-modifier offset compensation as
+   `_run_one_simulation_step`. Both write byte-identical local
+   positions; modifier composes once; two modes render the same
+   visual. See [[sim-playback-consistency-bug]] memory entry for
+   the full mechanism — and the false fix in v0.0.53 that
+   perturbed the input feedback loop.
+
+### User-validated correct behavior — DO NOT TRY TO FIX
+
+When the head animation activates (frame 7-8 in the YOKO test
+scene), seg 0 (root → index 1) stretches to ratio 3-8x while other
+segments stay tight. **This is the correct VBD transient physics**,
+NOT a bug. User wording: "ハリネズミ上の毛先はうごいていない。あたまと、
+毛根だけがうごいている" and "image #19 になるのが正しい". The chain
+catches up over subsequent frames; this is heavy-chain inertial lag.
+See [[sea-urchin-is-correct-transient]] memory entry.
+
+### Next-session task (user-specified at end of 2026-05-26)
+
+Try `VBD_SPRING_KD = 0.01` (currently 1.0) for natural drape.
+User said: "前回 XPBD で髪の毛が垂れました。KD を 0.01 にすると同じに
+なります。" Compare visual to the prior
+[[project_xpbd_natural_drape_checkpoint]] tag if needed.
+
+Adjust via UI panel or `bpy.context.window_manager.hair_sim_param_
+vbd_spring_kd = 0.01` then Stop → Start cycle. No code change
+required.
+
+### Current scene & runtime state
+
+- Target: `カーブ.001` (4474 strands × 8 points = 35,792 particles)
+- Default params (from `hair_sim_defaults.json`):
+  ke=1e8, kd=1.0, mass=1.0, gravity=-9.81, iter=100, substeps=4,
+  bending ke=100/kd=1.0, body collision = ON (CC_Base_Body)
+- Device: `cpu` (CUDA path triggers sm_120 illegal memory access
+  on Blackwell RTX 5070 Ti; Newton/Warp upstream issue)
+- Per-frame cost ~10s with substeps=16 (CPU, body collision on
+  takes ~5s extra)
+
+### Branch geography (end of 2026-05-26)
+
+```
+* vbd-features-applied  6a7742e   VBD milestone v0.0.54 (current)
+                        51bc057   Reduce free-particle mass to 0.01 (v0.0.49)
+                        ... prior v0.0.4x commits ...
+  vbd-direction         d15f953   (passthrough probe, predates VBD work)
+  main                  7e7f63a   (Phase 7W-G, frozen)
+  phase2-cpp            (quarantined legacy)
+```
+
+No push to `origin` on `vbd-features-applied` yet — user has not
+authorized.
+
+---
+
+## ⚠️ Previous handoff (vbd-direction, 2026-05-25 PM) — superseded
 
 ### Why the branch change
 
