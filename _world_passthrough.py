@@ -125,6 +125,13 @@ VBD_FREE_PARTICLE_MASS = 1.0     # mass for non-root particles
 VBD_GRAVITY            = -9.81   # m/s² along the up-axis (Z down)
 VBD_ITERATIONS         = 8       # VBD solver iterations per step
 
+# Substepping. Each Blender frame is divided into N internal sim
+# steps; per-substep dt = scene_dt / N. Smaller dt makes implicit
+# integrators (VBD/XPBD) more compliant per step and dramatically
+# improves constraint convergence and stability. Canonical lever
+# for inextensible chain behaviour (Macklin "Small Steps" 2019).
+VBD_SUBSTEPS           = 4
+
 # Self-contact (particle-particle collision). Newton's SolverVBD has
 # this OFF by default. We attempted to enable it at alpha-confirmed
 # (commit fde65e0, v0.0.36) and found that SolverVBD's self-contact
@@ -712,6 +719,14 @@ class WorldPassthrough:
         in_qd[root_indices]  = 0.0
 
         try:
+            # 3a. Refresh body-collision mesh to track body skinning at
+            #     this frame. Body pose doesn't change between substeps
+            #     within one Blender frame, so this is done once per
+            #     frame (not per substep).
+            if BODY_COLLISION_ENABLED and self._vbd_contacts is not None:
+                self._update_body_collider_vertices()
+
+            # 3b. Copy initial state into the solver's input buffer.
             in_q_np  = np.ascontiguousarray(in_q,  dtype=np.float32)
             in_qd_np = np.ascontiguousarray(in_qd, dtype=np.float32)
             tmp_q  = wp.from_numpy(in_q_np,  dtype=wp.vec3, device=device)
@@ -719,34 +734,38 @@ class WorldPassthrough:
             wp.copy(self._vbd_state_in.particle_q,  tmp_q)
             wp.copy(self._vbd_state_in.particle_qd, tmp_qd)
 
-            # 3a. Refresh body-collision mesh to track body skinning
-            #     at this frame, then run collision detection.
-            if BODY_COLLISION_ENABLED and self._vbd_contacts is not None:
-                self._update_body_collider_vertices()
-                self._vbd_model.collide(
-                    self._vbd_state_in,
+            # 3c. Substep loop. Each substep runs collide() + step() with
+            #     dt_sub = dt / N. Smaller dt makes the implicit solver
+            #     more compliant per step (XPBD: alpha = 1/(ke·dt²) grows;
+            #     VBD: smaller backward-Euler residual) → much better
+            #     convergence and stability ("Small Steps" Macklin 2019).
+            n_substeps = max(1, int(VBD_SUBSTEPS))
+            dt_sub = dt / float(n_substeps)
+            state_in  = self._vbd_state_in
+            state_out = self._vbd_state_out
+            for _ in range(n_substeps):
+                if BODY_COLLISION_ENABLED and self._vbd_contacts is not None:
+                    self._vbd_model.collide(state_in, self._vbd_contacts)
+                self._vbd_solver.step(
+                    state_in,
+                    state_out,
+                    self._vbd_control,
                     self._vbd_contacts,
+                    dt_sub,
                 )
+                # Swap so the next substep's input is this output.
+                state_in, state_out = state_out, state_in
 
-            # 3b. Step.
-            self._vbd_solver.step(
-                self._vbd_state_in,
-                self._vbd_state_out,
-                self._vbd_control,
-                self._vbd_contacts,
-                dt,
-            )
-
-            # 4. Read positions out. We must COPY here, not view —
-            #    wp.array.numpy() on CPU returns a buffer view backed by
-            #    the same memory as state_out.particle_q. If we kept the
-            #    view, the next solver.step() would update state_out
-            #    in-place and our `_prev_state.points_world` reference
-            #    would silently change with it, breaking the velocity
-            #    derivation below (which would become
-            #    (vbd_out_new - vbd_out_new) / dt = 0).
+            # After N swaps, the latest result lives in `state_in`.
+            # MUST copy (not view) — see XPBD-line bug discovery
+            # (commit ba16162): wp.array.numpy() on CPU returns a view
+            # backed by the same memory as state_in.particle_q. If we
+            # kept the view, the next solver.step() would update it
+            # in-place and our `_prev_state.points_world` reference
+            # would silently change with it, breaking velocity
+            # derivation `(new - prev) / dt = 0`.
             vbd_out = np.array(
-                self._vbd_state_out.particle_q.numpy(),
+                state_in.particle_q.numpy(),
                 dtype=np.float32, copy=True,
             ).reshape(n, 3)
         except Exception as exc:
