@@ -116,14 +116,31 @@ POINTS_PER_STRAND  = 8       # Uniform per Phase 3A scene investigation.
 BODY_COLLISION_TARGET   = "CC_Base_Body"
 BODY_COLLISION_ENABLED  = True
 
-# VBD sloppy physics values (intentionally arbitrary, per user spec for the
-# explosion test: any non-zero value is fine, zeros only allowed where
-# physically meaningful — currently only for the kinematic anchor mass).
-VBD_SPRING_KE          = 1000.0  # spring stiffness
+# VBD physics values, calibrated against the TinyVBD reference
+# implementation (Siggraph 2024 author AnkaChan):
+# https://github.com/AnkaChan/TinyVBD
+# TinyVBD's default strand test ("initializeTilted") uses:
+#   stiffness = 1e8, iterations = 100, substeps = 1, gravity = (0,-10,0),
+#   skip spring stiffness = 100, kinematic root via mVelocity.col(0).setZero()
+# We use lower main stiffness (1e6, not 1e8) as a conservative starting
+# point; iter=60 in the 50-100 band. Substep=4 is retained per user
+# (not TinyVBD's 1) so substep tuning is still available. Bending
+# (skip spring) is enabled per TinyVBD recipe.
+VBD_SPRING_KE          = 1e6     # spring stiffness (TinyVBD: 1e6–1e8)
 VBD_SPRING_KD          = 1.0     # spring damping
 VBD_FREE_PARTICLE_MASS = 1.0     # mass for non-root particles
 VBD_GRAVITY            = -9.81   # m/s² along the up-axis (Z down)
-VBD_ITERATIONS         = 8       # VBD solver iterations per step
+VBD_ITERATIONS         = 60      # VBD inner iterations per solver.step()
+                                 # (TinyVBD: 100)
+
+# Bending (skip) spring: connect (i, i+2) per strand. TinyVBD's recipe:
+# rest length = sum of two adjacent segments (= straight-line distance
+# when initial pose is straight). Newton's add_spring auto-derives rest
+# from initial positions (Euclidean), which equals the sum for a
+# straight initial strand and respects natural curve otherwise.
+VBD_BENDING_ENABLED    = True
+VBD_BENDING_KE         = 100.0   # TinyVBD: 100 (much weaker than segment)
+VBD_BENDING_KD         = 1.0
 
 # Substepping. Each Blender frame is divided into N internal sim
 # steps; per-substep dt = scene_dt / N. Smaller dt makes implicit
@@ -569,8 +586,8 @@ class WorldPassthrough:
                     mass = mass,
                 )
 
-            # Springs along each strand. Rest length is auto-derived by
-            # ModelBuilder from the initial particle positions.
+            # Segment springs along each strand (distance constraints).
+            # Rest length auto-derived from initial particle positions.
             for s in range(n_strands):
                 base = s * POINTS_PER_STRAND
                 for i in range(POINTS_PER_STRAND - 1):
@@ -578,6 +595,21 @@ class WorldPassthrough:
                         base + i, base + i + 1,
                         ke=VBD_SPRING_KE, kd=VBD_SPRING_KD, control=0.0,
                     )
+
+            # Bending (skip) springs: connect (i, i+2) per strand. Per
+            # TinyVBD's recipe. Weaker stiffness than segment springs;
+            # provides bending resistance so the strand doesn't fold
+            # at any joint while still allowing soft drape.
+            n_bending = 0
+            if VBD_BENDING_ENABLED:
+                for s in range(n_strands):
+                    base = s * POINTS_PER_STRAND
+                    for i in range(POINTS_PER_STRAND - 2):
+                        builder.add_spring(
+                            base + i, base + i + 2,
+                            ke=VBD_BENDING_KE, kd=VBD_BENDING_KD, control=0.0,
+                        )
+                        n_bending += 1
 
             # ----- Body collision (static mesh, baked at Start) ----- #
             if BODY_COLLISION_ENABLED:
@@ -614,13 +646,15 @@ class WorldPassthrough:
             self._vbd_device      = device
             self._vbd_module_warp = wp
 
+            n_segment = n_strands * (POINTS_PER_STRAND - 1)
             print(
                 f"[hair_sim/vbd] initialized on {device}: "
-                f"n_particles={n}, n_springs={n_strands * (POINTS_PER_STRAND - 1)}, "
-                f"iterations={VBD_ITERATIONS}, ke={VBD_SPRING_KE}, kd={VBD_SPRING_KD}, "
-                f"gravity={VBD_GRAVITY}, "
-                f"self_contact={VBD_SELF_CONTACT_ENABLED} "
-                f"(r={VBD_SELF_CONTACT_RADIUS}, m={VBD_SELF_CONTACT_MARGIN})"
+                f"n_particles={n}, "
+                f"n_segment_springs={n_segment}, n_bending_springs={n_bending}, "
+                f"iterations={VBD_ITERATIONS}, substeps={VBD_SUBSTEPS}, "
+                f"ke={VBD_SPRING_KE}, kd={VBD_SPRING_KD}, "
+                f"bending_ke={VBD_BENDING_KE if VBD_BENDING_ENABLED else 'off'}, "
+                f"gravity={VBD_GRAVITY}"
             )
             return True
         except Exception as exc:
