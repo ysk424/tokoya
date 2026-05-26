@@ -108,6 +108,14 @@ import numpy as np
 TARGET_NAME        = "カーブ.001"
 POINTS_PER_STRAND  = 8       # Uniform per Phase 3A scene investigation.
 
+# Body collision target. The full CC_Base_Body (225,184 verts /
+# 397,024 triangles) is registered as a Newton mesh collider so hair
+# particles collide with the character's surface. This commit adds it
+# as a STATIC mesh baked once at Start; the next commit will refresh
+# the mesh per frame to track body skinning.
+BODY_COLLISION_TARGET   = "CC_Base_Body"
+BODY_COLLISION_ENABLED  = True
+
 # VBD sloppy physics values (intentionally arbitrary, per user spec for the
 # explosion test: any non-zero value is fine, zeros only allowed where
 # physically meaningful — currently only for the kinematic anchor mass).
@@ -187,6 +195,7 @@ class WorldPassthrough:
         self._vbd_state_in      = None
         self._vbd_state_out     = None
         self._vbd_control       = None
+        self._vbd_contacts      = None  # allocated when body collision is enabled
         self._vbd_device        = None
         self._vbd_module_warp   = None  # cached `import warp` handle
 
@@ -387,6 +396,70 @@ class WorldPassthrough:
     # Simulation — NVIDIA Newton VBD (explosion test)
     # ----------------------------------------------------------- #
 
+    def _add_body_collider(self, builder, newton) -> bool:
+        """Register the body mesh as a kinematic collision shape.
+        Reads the EVALUATED body mesh (post-Armature) at the current
+        scene frame and converts to world coords, then adds it as a
+        kinematic (mass=0) body with one triangle-mesh shape.
+
+        Static bake — does NOT update per frame. The next commit adds
+        the per-frame vertex refresh."""
+        body_obj = bpy.data.objects.get(BODY_COLLISION_TARGET)
+        if body_obj is None or body_obj.type != 'MESH':
+            print(
+                f"[hair_sim/vbd] body collision skipped: "
+                f"'{BODY_COLLISION_TARGET}' not found or not a mesh"
+            )
+            return False
+
+        dg = bpy.context.evaluated_depsgraph_get()
+        body_eval = body_obj.evaluated_get(dg)
+        body_data = body_eval.data
+
+        n_v = len(body_data.vertices)
+        if n_v == 0:
+            print("[hair_sim/vbd] body collision skipped: empty mesh")
+            return False
+        v_flat = np.zeros(n_v * 3, dtype=np.float32)
+        body_data.vertices.foreach_get("co", v_flat)
+        v_local = v_flat.reshape(n_v, 3)
+
+        body_mw = np.array(body_obj.matrix_world, dtype=np.float32)
+        v_h = np.column_stack([v_local, np.ones(n_v, dtype=np.float32)])
+        v_world = (v_h @ body_mw.T)[:, :3].astype(np.float32, copy=True)
+
+        body_data.calc_loop_triangles()
+        n_t = len(body_data.loop_triangles)
+        if n_t == 0:
+            print("[hair_sim/vbd] body collision skipped: no triangles")
+            return False
+        t_idx = np.zeros(n_t * 3, dtype=np.int32)
+        body_data.loop_triangles.foreach_get("vertices", t_idx)
+
+        try:
+            body_mesh = newton.Mesh(
+                vertices        = v_world,
+                indices         = t_idx,
+                compute_inertia = False,
+                is_solid        = False,
+            )
+            collider_body_id = builder.add_body(mass=0.0, is_kinematic=True)
+            collider_shape_id = builder.add_shape_mesh(
+                body = collider_body_id,
+                mesh = body_mesh,
+            )
+        except Exception as exc:
+            print(f"[hair_sim/vbd] body collision build failed: {exc!r}")
+            return False
+
+        print(
+            f"[hair_sim/vbd] body collision: "
+            f"target={BODY_COLLISION_TARGET!r}, n_verts={n_v}, n_tris={n_t}, "
+            f"shape_id={collider_shape_id}, body_id={collider_body_id} "
+            f"(static / one-time bake at Start)"
+        )
+        return True
+
     def _ensure_vbd_initialized(self) -> bool:
         """Lazy-build the Newton VBD model + solver from the current
         `_prev_state` topology. No-op if already built. Returns True on
@@ -438,6 +511,10 @@ class WorldPassthrough:
                         ke=VBD_SPRING_KE, kd=VBD_SPRING_KD, control=0.0,
                     )
 
+            # ----- Body collision (static mesh, baked at Start) ----- #
+            if BODY_COLLISION_ENABLED:
+                self._add_body_collider(builder, newton)
+
             # SolverVBD requires graph-colored particles for parallel
             # updates. finalize() does NOT color implicitly; we must do
             # it explicitly between topology setup and finalize.
@@ -463,6 +540,9 @@ class WorldPassthrough:
             self._vbd_state_in    = model.state()
             self._vbd_state_out   = model.state()
             self._vbd_control     = model.control()
+            # Allocate Contacts buffer when body collision is enabled
+            # so model.collide() has somewhere to write contact data.
+            self._vbd_contacts    = model.contacts() if BODY_COLLISION_ENABLED else None
             self._vbd_device      = device
             self._vbd_module_warp = wp
 
@@ -481,6 +561,7 @@ class WorldPassthrough:
             self._vbd_model = self._vbd_solver = None
             self._vbd_state_in = self._vbd_state_out = None
             self._vbd_control = None
+            self._vbd_contacts = None
             self._vbd_device = None
             return False
 
@@ -577,12 +658,21 @@ class WorldPassthrough:
             wp.copy(self._vbd_state_in.particle_q,  tmp_q)
             wp.copy(self._vbd_state_in.particle_qd, tmp_qd)
 
-            # 3. Step.
+            # 3a. Run collision detection (body collision only). Newton's
+            #     SolverVBD step does NOT call collide() itself; it
+            #     consumes the populated contacts.soft_contact_* arrays.
+            if BODY_COLLISION_ENABLED and self._vbd_contacts is not None:
+                self._vbd_model.collide(
+                    self._vbd_state_in,
+                    self._vbd_contacts,
+                )
+
+            # 3b. Step.
             self._vbd_solver.step(
                 self._vbd_state_in,
                 self._vbd_state_out,
                 self._vbd_control,
-                None,   # contacts: none for this test
+                self._vbd_contacts,
                 dt,
             )
 
@@ -710,6 +800,7 @@ class WorldPassthrough:
         self._vbd_state_in  = None
         self._vbd_state_out = None
         self._vbd_control   = None
+        self._vbd_contacts  = None
 
         # Allocate (or reuse) the RAM bake. Clears mask either way.
         self._allocate_bake(scene)
@@ -749,6 +840,7 @@ class WorldPassthrough:
         self._vbd_state_in      = None
         self._vbd_state_out     = None
         self._vbd_control       = None
+        self._vbd_contacts      = None
         self._vbd_device        = None
         self._vbd_module_warp   = None
         self._initialized       = False
