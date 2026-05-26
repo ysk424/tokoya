@@ -11,61 +11,51 @@ from bpy.types import Operator, WindowManager
 from . import ui
 
 
-# Mode values for WindowManager.hair_sim_mode.
 MODE_BYPASS     = "BYPASS"
 MODE_SIMULATING = "SIMULATING"
 MODE_PLAYBACK   = "PLAYBACK"
 
 
 # ---------------------------------------------------------------------------
-# Research parameter panel (REMOVE FOR PRODUCTION).
+# Simulation parameter panel.
 #
-# Defaults live in hair_sim_defaults.json next to this file. At register
-# time we ABEND if the JSON is missing / unreadable / has missing keys
-# (per user spec: temporary research scaffold, no fallback). At
-# Start-operator time we snapshot the WM properties into the
-# _world_passthrough module constants — so Stop → change a value →
-# Start picks them up (Q2 = B, Stop/Start re-init only).
+# Defaults live in hair_sim_defaults.json. Values are snapshotted into
+# _world_passthrough module constants at each Start, so Stop → change → Start
+# picks them up. ABEND if JSON is missing or has missing keys.
 # ---------------------------------------------------------------------------
 
 _PARAM_FLOAT_KEYS = (
-    "VBD_SPRING_KE",
-    "VBD_SPRING_KD",
-    "VBD_FREE_PARTICLE_MASS",
-    "VBD_GRAVITY",
-    "VBD_BENDING_KE",
-    "VBD_BENDING_KD",
+    "SPRING_KE",
+    "SPRING_KD",
+    "PARTICLE_MASS",
+    "GRAVITY",
+    "BENDING_KE",
+    "BENDING_KD",
 )
 _PARAM_INT_KEYS = (
-    "VBD_ITERATIONS",
-    "VBD_SUBSTEPS",
+    "ITERATIONS",
+    "SUBSTEPS",
 )
 _PARAM_BOOL_KEYS = (
-    "VBD_BENDING_ENABLED",
-    "VBD_SELF_CONTACT_ENABLED",
+    "BENDING_ENABLED",
     "BODY_COLLISION_ENABLED",
 )
 _PARAM_STR_KEYS = (
     "BODY_COLLISION_TARGET",
 )
 
-# WM attribute name = lowercased key prefixed with hair_sim_param_.
-def _wm_attr(const_name: str) -> str:
-    return "hair_sim_param_" + const_name.lower()
+def _wm_attr(key: str) -> str:
+    return "hair_sim_param_" + key.lower()
 
 
 def _load_defaults_json() -> dict:
     path = os.path.join(os.path.dirname(__file__), "hair_sim_defaults.json")
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    required = (
-        _PARAM_FLOAT_KEYS + _PARAM_INT_KEYS + _PARAM_BOOL_KEYS + _PARAM_STR_KEYS
-    )
-    missing = [k for k in required if k not in data]
+    required = _PARAM_FLOAT_KEYS + _PARAM_INT_KEYS + _PARAM_BOOL_KEYS + _PARAM_STR_KEYS
+    missing  = [k for k in required if k not in data]
     if missing:
-        raise RuntimeError(
-            f"hair_sim_defaults.json missing keys: {missing}"
-        )
+        raise RuntimeError(f"hair_sim_defaults.json missing keys: {missing}")
     return data
 
 
@@ -89,80 +79,50 @@ def _register_param_props(defaults: dict) -> None:
 
 
 def _unregister_param_props() -> None:
-    for key in (
-        _PARAM_FLOAT_KEYS + _PARAM_INT_KEYS + _PARAM_BOOL_KEYS + _PARAM_STR_KEYS
-    ):
+    for key in _PARAM_FLOAT_KEYS + _PARAM_INT_KEYS + _PARAM_BOOL_KEYS + _PARAM_STR_KEYS:
         try:
             delattr(WindowManager, _wm_attr(key))
         except Exception:
             pass
 
 
-def _snapshot_params_into_passthrough(wm: bpy.types.WindowManager) -> None:
-    """Push current WM property values onto the _world_passthrough module
-    constants. Called at Start, BEFORE _solver.start() builds the VBD
-    model — so the values are picked up by the next sim build."""
+def _snapshot_params(wm: bpy.types.WindowManager) -> None:
+    """Push current WM property values into the sim engine module constants."""
     from . import _world_passthrough as _wp
-    for key in (
-        _PARAM_FLOAT_KEYS + _PARAM_INT_KEYS + _PARAM_BOOL_KEYS + _PARAM_STR_KEYS
-    ):
+    for key in _PARAM_FLOAT_KEYS + _PARAM_INT_KEYS + _PARAM_BOOL_KEYS + _PARAM_STR_KEYS:
         setattr(_wp, key, getattr(wm, _wm_attr(key)))
-    print(
-        "[hair_sim] params snapshotted: "
-        f"ke={_wp.VBD_SPRING_KE} kd={_wp.VBD_SPRING_KD} "
-        f"mass={_wp.VBD_FREE_PARTICLE_MASS} g={_wp.VBD_GRAVITY} "
-        f"iter={_wp.VBD_ITERATIONS} sub={_wp.VBD_SUBSTEPS} "
-        f"bend={_wp.VBD_BENDING_ENABLED}/ke={_wp.VBD_BENDING_KE}/kd={_wp.VBD_BENDING_KD} "
-        f"selfc={_wp.VBD_SELF_CONTACT_ENABLED} "
-        f"body={_wp.BODY_COLLISION_ENABLED}/{_wp.BODY_COLLISION_TARGET}"
-    )
+    vals = ", ".join(f"{k}={getattr(_wp, k)}" for k in _PARAM_FLOAT_KEYS + _PARAM_INT_KEYS)
+    print(f"[hair_sim] params: {vals}")
 
+
+# ---------------------------------------------------------------------------
+# Solver interface
+# ---------------------------------------------------------------------------
 
 class SolverInterface:
-    """Thin facade between operators / handler and the WorldPassthrough
-    state owner. Holds the single live passthrough instance for the
-    current Blender session."""
+    """Thin facade between operators / handler and WorldPassthrough."""
 
     def __init__(self) -> None:
         self._passthrough = None
 
     def start(self, scene: bpy.types.Scene) -> bool:
-        """Initialize (or re-initialize) the passthrough at the current
-        frame.
-
-        **Instance reuse** (load-bearing for bake-allocation cost):
-        the existing WorldPassthrough instance is preserved across
-        Start calls. WorldPassthrough.start() then runs against the
-        live instance, and `_allocate_bake` reuses the existing bake
-        buffer if its shape matches the scene's animation length —
-        avoiding a ~1 GB re-allocation on every Stop→Start cycle.
-        A fresh instance is created only on first-ever Start, or
-        after teardown (extension unregister)."""
         try:
             from . import _world_passthrough
         except Exception as exc:
-            print(f"[hair_sim] start failed: import _world_passthrough: {exc!r}")
+            print(f"[hair_sim] import failed: {exc!r}")
             return False
 
         obj = bpy.data.objects.get(_world_passthrough.TARGET_NAME)
         if obj is None or obj.type != "CURVES":
-            print(f"[hair_sim] start failed: target "
-                  f"'{_world_passthrough.TARGET_NAME}' missing or not Curves")
+            print(f"[hair_sim] start failed: '{_world_passthrough.TARGET_NAME}' missing or not Curves")
             return False
 
-        # Reuse the existing passthrough instance if present so that
-        # the bake buffer survives Stop → Start cycles. Only create a
-        # new instance on first Start (or after teardown).
         if self._passthrough is None:
             self._passthrough = _world_passthrough.WorldPassthrough()
 
-        if not self._passthrough.start(obj, scene):
-            return False
-        return True
+        return self._passthrough.start(obj, scene)
 
     def teardown(self) -> None:
-        """Full state cleanup. Only called by `unregister()`. Stop and
-        Bypass operators do NOT teardown — they only change mode."""
         if self._passthrough is not None:
             try:
                 self._passthrough.teardown()
@@ -171,15 +131,11 @@ class SolverInterface:
         self._passthrough = None
 
     def step(self, scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> None:
-        """SIMULATING-mode per-frame entry: scrub-restore from bake, or
-        run one sim step on +1, or re-baseline on jump."""
         if self._passthrough is None:
             return
         self._passthrough.step(scene)
 
     def playback(self, scene: bpy.types.Scene) -> None:
-        """PLAYBACK-mode per-frame entry: push baked state to Blender if
-        the current frame is baked; otherwise leave Blender alone."""
         if self._passthrough is None:
             return
         self._passthrough.playback(scene)
@@ -188,12 +144,12 @@ class SolverInterface:
 _solver = SolverInterface()
 
 
+# ---------------------------------------------------------------------------
+# Frame handler
+# ---------------------------------------------------------------------------
+
 @persistent
 def _on_frame_change_post(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> None:
-    """Per-frame dispatcher. Branches by `WindowManager.hair_sim_mode`:
-      BYPASS      → return immediately (Blender handles everything).
-      SIMULATING  → call solver.step().
-      PLAYBACK    → call solver.playback()."""
     wm = bpy.context.window_manager
     if wm is None:
         return
@@ -207,46 +163,27 @@ def _on_frame_change_post(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph
 
 
 def _install_handler() -> None:
-    handlers = bpy.app.handlers.frame_change_post
-    if _on_frame_change_post not in handlers:
-        handlers.append(_on_frame_change_post)
+    if _on_frame_change_post not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(_on_frame_change_post)
 
 
 def _uninstall_handler() -> None:
-    handlers = bpy.app.handlers.frame_change_post
-    if _on_frame_change_post in handlers:
-        handlers.remove(_on_frame_change_post)
+    if _on_frame_change_post in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(_on_frame_change_post)
 
+
+# ---------------------------------------------------------------------------
+# Operators
+# ---------------------------------------------------------------------------
 
 class HAIR_SIM_OT_start(Operator):
-    bl_idname = "hair_sim.start"
-    bl_label = "Start"
-    bl_description = (
-        "Enter SIMULATING mode. Initialize the simulator at the current "
-        "frame and allocate the RAM bake. Consecutive +1 frame advances "
-        "run simulation; scrub-back to a baked frame restores from bake"
-    )
+    bl_idname   = "hair_sim.start"
+    bl_label    = "Start"
+    bl_description = "Enter SIMULATING mode"
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         wm = context.window_manager
-
-        # Research panel: snapshot WM params into _world_passthrough
-        # constants BEFORE _solver.start() builds the VBD model.
-        # (REMOVE FOR PRODUCTION along with the rest of the param panel.)
-        _snapshot_params_into_passthrough(wm)
-
-        from . import _native_loader
-        native = _native_loader.get_native()
-        if native is None:
-            self.report({"WARNING"}, "Native module not available — continuing without it")
-        else:
-            try:
-                value = native.add(2, 3)
-                phase = native.phase
-                self.report({"INFO"}, f"Native ok: phase={phase!r}  add(2,3)={value}")
-            except Exception as exc:
-                self.report({"WARNING"}, f"Native call failed: {exc} — continuing anyway")
-
+        _snapshot_params(wm)
         if not _solver.start(context.scene):
             self.report({"ERROR"}, "Hair sim start failed (see system console)")
             return {"CANCELLED"}
@@ -256,32 +193,22 @@ class HAIR_SIM_OT_start(Operator):
 
 
 class HAIR_SIM_OT_stop(Operator):
-    bl_idname = "hair_sim.stop"
-    bl_label = "Stop"
-    bl_description = (
-        "Enter PLAYBACK mode. No further simulation runs; on each frame "
-        "change the baked state for that frame is pushed back to "
-        "Blender. State and bake are preserved (Start to resume)"
-    )
+    bl_idname   = "hair_sim.stop"
+    bl_label    = "Stop"
+    bl_description = "Enter PLAYBACK mode"
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         wm = context.window_manager
         wm.hair_sim_mode = MODE_PLAYBACK
-        # Immediately push current frame's bake (if any) so the viewport
-        # reflects the playback state without waiting for a frame change.
         _solver.playback(context.scene)
         self.report({"INFO"}, "Hair sim → PLAYBACK")
         return {"FINISHED"}
 
 
 class HAIR_SIM_OT_bypass(Operator):
-    bl_idname = "hair_sim.bypass"
-    bl_label = "Bypass"
-    bl_description = (
-        "Enter BYPASS mode. The extension stops intercepting frame "
-        "changes entirely — Blender handles everything natively. State "
-        "and bake are preserved (Start / Stop to resume)"
-    )
+    bl_idname   = "hair_sim.bypass"
+    bl_label    = "Bypass"
+    bl_description = "Enter BYPASS mode — extension does nothing"
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         wm = context.window_manager
@@ -297,24 +224,25 @@ _classes = (
 )
 
 
-def register() -> None:
-    # Research param panel: load JSON first (ABEND on failure, per
-    # user spec). REMOVE FOR PRODUCTION.
-    _defaults = _load_defaults_json()
+# ---------------------------------------------------------------------------
+# Register / unregister
+# ---------------------------------------------------------------------------
 
+def register() -> None:
+    _defaults = _load_defaults_json()
     for cls in _classes:
         bpy.utils.register_class(cls)
     WindowManager.hair_sim_mode = EnumProperty(
         name="Hair Sim Mode",
         items=[
-            (MODE_BYPASS,     "Bypass",     "Extension does nothing — Blender handles all"),
-            (MODE_SIMULATING, "Simulating", "Run sim on consecutive frames; restore from bake on scrub"),
-            (MODE_PLAYBACK,   "Playback",   "Push baked state on every frame; no simulation"),
+            (MODE_BYPASS,     "Bypass",     "Extension inactive"),
+            (MODE_SIMULATING, "Simulating", "Run sim on +1 frames; restore from bake on scrub"),
+            (MODE_PLAYBACK,   "Playback",   "Push baked state; no simulation"),
         ],
         default=MODE_BYPASS,
         options={"SKIP_SAVE"},
     )
-    _register_param_props(_defaults)  # REMOVE FOR PRODUCTION
+    _register_param_props(_defaults)
     ui.register()
     _install_handler()
 
@@ -326,7 +254,7 @@ def unregister() -> None:
         pass
     _uninstall_handler()
     ui.unregister()
-    _unregister_param_props()  # REMOVE FOR PRODUCTION
+    _unregister_param_props()
     del WindowManager.hair_sim_mode
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
