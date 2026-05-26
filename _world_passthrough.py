@@ -498,9 +498,21 @@ class WorldPassthrough:
           Input to VBD:
             q [non_root]  = _prev_state.points_world[non_root]
             q [root]      = evaluated_world[root]                      ← head boundary
-            qd[non_root]  = _prev_state.velocities_world[non_root]
-            qd[root]      = (evaluated_world[root]
-                             - _prev_state.points_world[root]) / dt    ← head velocity
+            qd[non_root]  = _prev_state.velocities_world[non_root]    ← inertia
+            qd[root]      = 0                                          ← see warning below
+
+        ⚠ Kinematic-root velocity is intentionally zero. XPBD's predict
+        step (verified on a 2-particle probe at the XPBD line, v0.0.38)
+        integrates ALL particles by `x_new = x_old + v*dt`, including
+        mass=0 — it only skips constraint corrections. Passing the
+        derived head velocity there causes `solver_out[root] =
+        2*eval_now - eval_prev` (the "hair drifts 2× the head" bug).
+        VBD's internal integration is different (energy-based,
+        coordinate descent) and may not have the same bug, but the
+        fix is harmless: in_q[root] = eval_now is authoritative,
+        spring forces feel root motion through frame-to-frame position
+        change, no velocity needs to be communicated for kinematic
+        particles. Keeping it zero on VBD too as a defensive carryover.
 
         Spring forces (rest length fixed at the initial geometry) pull
         the non-root particles toward the moved roots over subsequent
@@ -551,9 +563,11 @@ class WorldPassthrough:
 
         root_indices = self._root_indices  # cached (n_strands,) int32
         in_q [root_indices]  = eval_world[root_indices]
-        in_qd[root_indices]  = (
-            (eval_world[root_indices] - self._prev_state.points_world[root_indices]) / dt
-        ).astype(np.float32, copy=False)
+        # ⚠ in_qd[root] MUST be zero — see function docstring. XPBD's
+        # predict step would double-integrate if a non-zero velocity is
+        # passed here; VBD may not have the same bug but the fix is
+        # harmless and we keep it defensively.
+        in_qd[root_indices]  = 0.0
 
         try:
             in_q_np  = np.ascontiguousarray(in_q,  dtype=np.float32)
