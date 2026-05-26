@@ -81,6 +81,10 @@ class WorldPassthrough:
 
         self._step_count        = 0
 
+        # Taichi XPBD solver (created lazily on first sim step).
+        self._taichi_solver     = None
+        self._body_bvh          = None   # rebuilt each frame when body collision on
+
     # ------------------------------------------------------------------ #
     # Bake helpers
     # ------------------------------------------------------------------ #
@@ -228,41 +232,102 @@ class WorldPassthrough:
     # Simulation step — Taichi XPBD goes here
     # ------------------------------------------------------------------ #
 
+    def _ensure_taichi_solver(self) -> bool:
+        """Lazy-build the Taichi XPBD solver from current _prev_state topology."""
+        if self._taichi_solver is not None:
+            return True
+        if self._prev_state is None:
+            return False
+        try:
+            from . import _sim_taichi
+            cls = _sim_taichi.get_solver_class()
+            n_strands = self._n_total // POINTS_PER_STRAND
+            self._taichi_solver = cls(
+                n_total         = self._n_total,
+                n_strands       = n_strands,
+                pps             = POINTS_PER_STRAND,
+                init_pos        = self._prev_state.points_world,
+                particle_mass   = PARTICLE_MASS,
+                bending_enabled = BENDING_ENABLED,
+            )
+            print(
+                f"[hair_sim/taichi] solver ready: "
+                f"n={self._n_total}, strands={n_strands}, pps={POINTS_PER_STRAND}, "
+                f"ke={SPRING_KE}, kd={SPRING_KD}, iter={ITERATIONS}, sub={SUBSTEPS}"
+            )
+            return True
+        except Exception as exc:
+            print(f"[hair_sim/taichi] solver build failed: {exc!r}")
+            return False
+
     def _run_one_simulation_step(self, scene: bpy.types.Scene) -> bool:
-        """Advance hair state by one frame.
+        """Advance hair state by one frame using Taichi XPBD.
 
-        TODO: replace the identity placeholder below with Taichi XPBD.
-
-        Contract (must be preserved by any replacement):
+        Contract:
           * Read EVALUATED world positions for roots (head boundary).
           * Compute modifier offset = evaluated − original.
-          * Produce sim_out (n_total, 3) float32 in world coords.
-          * Write: original ← sim_out − offset  (modifier adds offset back).
-          * Atomically update self._prev_state and self._last_frame.
-          * Return True on success, False on any failure (state unchanged).
+          * Run XPBD on GPU → sim_out (n_total, 3) world coords.
+          * Optionally apply body collision (Python BVHTree, once per frame).
+          * Write: original ← sim_out − offset.
+          * Atomically update _prev_state and _last_frame.
         """
         if self._prev_state is None:
             return False
         obj = bpy.data.objects.get(self._target_obj_name)
         if obj is None:
             return False
+        if not self._ensure_taichi_solver():
+            return False
 
         n  = self._n_total
         dt = float(scene.render.fps_base) / float(scene.render.fps)
 
-        dg       = bpy.context.evaluated_depsgraph_get()
-        obj_eval = obj.evaluated_get(dg)
+        # Read evaluated (head-tracked) and original world positions.
+        dg         = bpy.context.evaluated_depsgraph_get()
+        obj_eval   = obj.evaluated_get(dg)
         eval_world = self._read_world_positions(obj_eval.data)
         orig_world = self._read_world_positions(obj.data)
         if eval_world is None or orig_world is None:
             return False
         offset_world = eval_world - orig_world
 
-        # ---- Taichi XPBD will replace this block ----
-        # Placeholder: identity passthrough (hair follows head, no physics).
-        sim_out = eval_world.copy()
-        # ---- end placeholder ----
+        # Root world positions for this frame.
+        new_root_world = eval_world[self._root_indices]  # (n_strands, 3)
 
+        # Upload prev frame state to solver.
+        self._taichi_solver.set_positions_velocities(
+            self._prev_state.points_world,
+            self._prev_state.velocities_world,
+        )
+
+        # Run XPBD on GPU.
+        from . import _sim_taichi
+        sim_out = self._taichi_solver.run_frame(
+            dt              = dt,
+            n_substeps      = SUBSTEPS,
+            n_iter          = ITERATIONS,
+            gravity         = GRAVITY,
+            new_root_world  = new_root_world,
+            seg_ke          = SPRING_KE,
+            bend_ke         = BENDING_KE,
+            damping         = SPRING_KD,
+            bending_enabled = BENDING_ENABLED,
+        )  # (n_total, 3) float32
+
+        # Body collision (optional, Python BVHTree — once per frame).
+        if BODY_COLLISION_ENABLED:
+            try:
+                bvh = _sim_taichi.build_body_bvh(BODY_COLLISION_TARGET)
+                if bvh is not None:
+                    _sim_taichi.apply_body_collision(sim_out, bvh)
+                    # Sync corrected positions back to solver for next frame's vel.
+                    self._taichi_solver._upload_pos(
+                        np.ascontiguousarray(sim_out, dtype=np.float32)
+                    )
+            except Exception as exc:
+                print(f"[hair_sim/taichi] body collision error (suppressed): {exc!r}")
+
+        # Writeback with modifier-offset compensation.
         write_world = sim_out - offset_world
         mw_inv  = np.array(obj.matrix_world.inverted(), dtype=np.float32)
         world_h = np.column_stack([write_world, np.ones(n, dtype=np.float32)])
@@ -274,12 +339,11 @@ class WorldPassthrough:
         attr.data.foreach_set("vector", local_pts.ravel())
         obj.data.update_tag()
 
-        new_vel = ((sim_out - self._prev_state.points_world) / dt).astype(
-            np.float32, copy=False
-        )
+        # Atomic state commit.
+        sim_vel = self._taichi_solver.get_velocities_numpy()
         self._prev_state = HairFrameState(
             points_world     = sim_out,
-            velocities_world = new_vel,
+            velocities_world = sim_vel,
             frame            = scene.frame_current,
         )
         self._last_frame = scene.frame_current
@@ -328,7 +392,11 @@ class WorldPassthrough:
         self._initialized     = True
 
         n_strands = n_total // POINTS_PER_STRAND
-        self._root_indices = (np.arange(n_strands, dtype=np.int32) * POINTS_PER_STRAND)
+        self._root_indices  = (np.arange(n_strands, dtype=np.int32) * POINTS_PER_STRAND)
+
+        # Reset solver so it rebuilds from the new initial state.
+        self._taichi_solver = None
+        self._body_bvh      = None
 
         self._allocate_bake(scene)
 
@@ -359,6 +427,8 @@ class WorldPassthrough:
         self._bake_mask        = None
         self._bake_frame_start = None
         self._bake_frame_end   = None
+        self._taichi_solver    = None
+        self._body_bvh         = None
         self._initialized      = False
         self._step_error_active = False
 
