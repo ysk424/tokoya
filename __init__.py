@@ -1,397 +1,215 @@
 from __future__ import annotations
-
-import json
-import math
-import os
-
+import json, math, os
 import bpy
-from bpy.app.handlers import persistent
-from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, FloatProperty, IntProperty, StringProperty
 from bpy.types import Operator, WindowManager
-
 from . import ui
 
 
-MODE_BYPASS     = "BYPASS"
-MODE_SIMULATING = "SIMULATING"
-MODE_PLAYBACK   = "PLAYBACK"
-
-
-# ---------------------------------------------------------------------------
-# Parameter definitions
-#
-# All values in tokoya_defaults.json and _world_passthrough.py are
-# PHYSICS values. WM properties store USER-FRIENDLY display values:
-#
-#   SPRING_KE / ROOT_BENDING_KE / BENDING_KE : log10(physics)
-#       display 4.0 → physics 10,000
-#   DAMPING : physics × 100
-#       display 1.0  → physics 0.01
-#   PARTICLE_MASS : physics × 1000
-#       display 1000 → physics 1.0
-#
-# Conversions are applied in _snapshot_params() at each Start.
-# ---------------------------------------------------------------------------
-
-def _physics_to_display(key: str, phys) -> float:
-    """Convert physics value (from JSON) to UI display value."""
-    if key in ("SPRING_KE", "ROOT_BENDING_KE", "BENDING_KE"):
-        return math.log10(max(float(phys), 1e-10))
-    if key == "DAMPING":
-        return float(phys) * 100.0
-    if key == "PARTICLE_MASS":
-        return float(phys) * 1000.0
-    return float(phys)
-
-
-def _display_to_physics(key: str, disp) -> float:
-    """Convert UI display value back to physics value."""
-    if key in ("SPRING_KE", "ROOT_BENDING_KE", "BENDING_KE"):
-        return 10.0 ** float(disp)
-    if key == "DAMPING":
-        return float(disp) / 100.0
-    if key == "PARTICLE_MASS":
-        return float(disp) / 1000.0
-    return float(disp)
-
-
-# Float property specs: (name, description, min, max, soft_min, soft_max, step, precision)
-_FLOAT_SPECS: dict[str, dict] = {
-    "SPRING_KE": dict(
-        name        = "Stiffness 10^N",
-        description = "log10 segment spring stiffness. 4.0 → 10,000",
-        min=1.0, max=9.0, soft_min=2.0, soft_max=7.0, step=10, precision=2,
-    ),
-    "DAMPING": dict(
-        name        = "Damping /100",
-        description = "Velocity damping per substep. Display / 100 = actual. 1.0 → 0.01",
-        min=0.0, max=50.0, soft_min=0.0, soft_max=20.0, step=10, precision=1,
-    ),
-    "PARTICLE_MASS": dict(
-        name        = "Mass /1000",
-        description = "Free particle mass. Display / 1000 = actual kg. 1000 → 1.0 kg",
-        min=1.0, max=10000.0, soft_min=10.0, soft_max=5000.0, step=100, precision=1,
-    ),
-    "GRAVITY": dict(
-        name        = "Gravity m/s2",
-        description = "Gravitational acceleration along -Z axis",
-        min=-20.0, max=0.0, soft_min=-15.0, soft_max=0.0, step=10, precision=2,
-    ),
-    "ROOT_BENDING_KE": dict(
-        name        = "Root Stiff 10^N",
-        description = "log10 root bending stiffness (first 2 joints). 3.3 → 2,000",
-        min=0.0, max=7.0, soft_min=1.0, soft_max=5.0, step=10, precision=2,
-    ),
-    "BENDING_KE": dict(
-        name        = "Strand Stiff 10^N",
-        description = "log10 strand bending stiffness (remaining joints). 1.0 → 10",
-        min=0.0, max=6.0, soft_min=0.0, soft_max=4.0, step=10, precision=2,
-    ),
-}
-
-_PARAM_FLOAT_KEYS = (
-    "SPRING_KE", "DAMPING", "PARTICLE_MASS", "GRAVITY",
-    "ROOT_BENDING_KE", "BENDING_KE",
-)
-_PARAM_INT_KEYS  = ("ITERATIONS", "SUBSTEPS")
-_PARAM_BOOL_KEYS = ("BENDING_ENABLED", "BODY_COLLISION_ENABLED")
-_PARAM_STR_KEYS  = ("BODY_COLLISION_TARGET",)
-
-_ALL_KEYS = _PARAM_FLOAT_KEYS + _PARAM_INT_KEYS + _PARAM_BOOL_KEYS + _PARAM_STR_KEYS
-
-
-def _wm_attr(key: str) -> str:
-    return "tokoya_param_" + key.lower()
-
-
-def _load_defaults_json() -> dict:
+def _load_defaults():
     path = os.path.join(os.path.dirname(__file__), "tokoya_defaults.json")
     with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    missing = [k for k in _ALL_KEYS if k not in data]
-    if missing:
-        raise RuntimeError(f"tokoya_defaults.json missing keys: {missing}")
-    return data
+        return json.load(f)
 
 
-def _register_param_props(defaults: dict) -> None:
-    for key in _PARAM_FLOAT_KEYS:
-        spec = _FLOAT_SPECS.get(key, {})
-        disp_default = _physics_to_display(key, defaults[key])
-        setattr(WindowManager, _wm_attr(key), FloatProperty(
-            name        = spec.get("name", key),
-            description = spec.get("description", ""),
-            default     = disp_default,
-            min         = spec.get("min", -1e9),
-            max         = spec.get("max",  1e9),
-            soft_min    = spec.get("soft_min", spec.get("min", -1e9)),
-            soft_max    = spec.get("soft_max", spec.get("max",  1e9)),
-            step        = spec.get("step", 3),
-            precision   = spec.get("precision", 3),
-            options     = {"SKIP_SAVE"},
-        ))
-    _int_labels = {"ITERATIONS": "Iterations", "SUBSTEPS": "Substeps"}
-    for key in _PARAM_INT_KEYS:
-        setattr(WindowManager, _wm_attr(key), IntProperty(
-            name    = _int_labels.get(key, key),
-            default = int(defaults[key]),
-            min     = 1,
-            max     = 64,
-            options = {"SKIP_SAVE"},
-        ))
-    for key in _PARAM_BOOL_KEYS:
-        setattr(WindowManager, _wm_attr(key), BoolProperty(
-            name    = key,
-            default = bool(defaults[key]),
-            options = {"SKIP_SAVE"},
-        ))
-    for key in _PARAM_STR_KEYS:
-        setattr(WindowManager, _wm_attr(key), StringProperty(
-            name    = key,
-            default = str(defaults[key]),
-            options = {"SKIP_SAVE"},
-        ))
-
-
-def _unregister_param_props() -> None:
-    for key in _ALL_KEYS:
-        try:
-            delattr(WindowManager, _wm_attr(key))
-        except Exception:
-            pass
-
-
-def _snapshot_params(wm: bpy.types.WindowManager) -> None:
-    """Push display values → physics values into the sim engine module."""
+def _snapshot_sim_params(wm):
     from . import _world_passthrough as _wp
-    for key in _ALL_KEYS:
-        disp = getattr(wm, _wm_attr(key))
-        if key in _PARAM_FLOAT_KEYS:
-            setattr(_wp, key, _display_to_physics(key, disp))
-        else:
-            setattr(_wp, key, disp)
-    phys_vals = ", ".join(
-        f"{k}={getattr(_wp, k):.4g}" for k in _PARAM_FLOAT_KEYS
-    )
-    print(f"[tokoya] params (physics): {phys_vals}")
+    _wp.SPRING_KE       = 10.0 ** wm.tokoya_spring_ke
+    _wp.DAMPING         = wm.tokoya_damping       / 100.0
+    _wp.PARTICLE_MASS   = wm.tokoya_particle_mass / 1000.0
+    _wp.GRAVITY         = wm.tokoya_gravity
+    _wp.ITERATIONS      = wm.tokoya_iterations
+    _wp.SUBSTEPS        = wm.tokoya_substeps
+    _wp.BENDING_ENABLED = wm.tokoya_bending_enabled
+    _wp.ROOT_BENDING_KE = 10.0 ** wm.tokoya_root_bending_ke
+    _wp.BENDING_KE      = 10.0 ** wm.tokoya_bending_ke
 
 
-# ---------------------------------------------------------------------------
-# Save / Load preset operators
-# ---------------------------------------------------------------------------
+def _find_curves_obj():
+    objs = [o for o in bpy.data.objects if o.type == "CURVES"]
+    return objs[0] if len(objs) == 1 else None
 
-class TOKOYA_OT_save_params(Operator):
-    bl_idname    = "tokoya.save_params"
-    bl_label     = "Save Params"
-    bl_description = "Save current parameters to a JSON preset file"
-    filepath: StringProperty(subtype="FILE_PATH", default="tokoya_params.json")
 
-    def invoke(self, context, event):
-        context.window_manager.fileselect_add(self)
-        return {"RUNNING_MODAL"}
+class TOKOYA_OT_plant_hair(Operator):
+    bl_idname      = "tokoya.plant_hair"
+    bl_label       = "Plant Hair"
+    bl_description = "Plant strands via Vogel spiral seeded from Ref Object (Empty)"
 
-    def execute(self, context: bpy.types.Context) -> set[str]:
-        wm = context.window_manager
-        out: dict = {}
-        for key in _PARAM_FLOAT_KEYS:
-            out[key] = _display_to_physics(key, getattr(wm, _wm_attr(key)))
-        for key in _PARAM_INT_KEYS + _PARAM_BOOL_KEYS + _PARAM_STR_KEYS:
-            out[key] = getattr(wm, _wm_attr(key))
+    def execute(self, context):
+        wm       = context.window_manager
+        ref_name = wm.tokoya_ref_obj.strip()
+        if not ref_name:
+            self.report({"ERROR"}, "Ref Object is empty"); return {"CANCELLED"}
+        ref_obj = bpy.data.objects.get(ref_name)
+        if ref_obj is None:
+            self.report({"ERROR"}, f"Object {ref_name!r} not found"); return {"CANCELLED"}
+        if ref_obj.type != "EMPTY":
+            self.report({"WARNING"}, f"{ref_name!r} is {ref_obj.type}, not EMPTY")
+        from . import _spiral_plant
         try:
-            with open(self.filepath, "w", encoding="utf-8") as f:
-                json.dump(out, f, indent=4)
-            self.report({"INFO"}, f"Saved to {self.filepath}")
-        except Exception as exc:
-            self.report({"ERROR"}, f"Save failed: {exc}")
-            return {"CANCELLED"}
+            r = _spiral_plant.plant_hair(ref_obj, alpha_cm=wm.tokoya_alpha, beta_cm=wm.tokoya_beta)
+        except (ValueError, RuntimeError) as exc:
+            self.report({"ERROR"}, str(exc)); return {"CANCELLED"}
+        self.report({"INFO"},
+            f"Planted {r['n_added']} strands (total {r['total_curves']}). "
+            f"Root-surface max {r['root_to_surface_max_um']:.1f} um")
         return {"FINISHED"}
 
 
-class TOKOYA_OT_load_params(Operator):
-    bl_idname    = "tokoya.load_params"
-    bl_label     = "Load Params"
-    bl_description = "Load parameters from a JSON preset file"
-    filepath: StringProperty(subtype="FILE_PATH")
-    filter_glob: StringProperty(default="*.json", options={"HIDDEN"})
+class TOKOYA_OT_extend(Operator):
+    bl_idname      = "tokoya.extend"
+    bl_label       = "Extend"
+    bl_description = "Scale all strands from root to N cm (N = number field)"
 
-    def invoke(self, context, event):
-        context.window_manager.fileselect_add(self)
-        return {"RUNNING_MODAL"}
-
-    def execute(self, context: bpy.types.Context) -> set[str]:
-        try:
-            with open(self.filepath, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as exc:
-            self.report({"ERROR"}, f"Load failed: {exc}")
-            return {"CANCELLED"}
-        wm = context.window_manager
-        loaded = []
-        for key, phys_val in data.items():
-            attr = _wm_attr(key)
-            if not hasattr(wm, attr):
-                continue
-            setattr(wm, attr,
-                    _physics_to_display(key, phys_val) if key in _PARAM_FLOAT_KEYS
-                    else phys_val)
-            loaded.append(key)
-        self.report({"INFO"}, f"Loaded {len(loaded)} params")
+    def execute(self, context):
+        obj = _find_curves_obj()
+        if obj is None:
+            self.report({"ERROR"}, "Need exactly one Curves object"); return {"CANCELLED"}
+        from . import _mesh_ops
+        n = _mesh_ops.extend_length(obj, target_m=context.window_manager.tokoya_n / 100.0)
+        self.report({"INFO"}, f"Extended {n} strands to {context.window_manager.tokoya_n:.1f} cm")
         return {"FINISHED"}
 
 
-# ---------------------------------------------------------------------------
-# Solver interface
-# ---------------------------------------------------------------------------
+class TOKOYA_OT_simulate(Operator):
+    bl_idname      = "tokoya.simulate"
+    bl_label       = "Simulate"
+    bl_description = "Run N steps of Taichi XPBD. Body vs CC_Base_Body. N = number field"
 
-class SolverInterface:
-    def __init__(self) -> None:
-        self._passthrough = None
-
-    def start(self, scene: bpy.types.Scene) -> bool:
-        try:
-            from . import _world_passthrough
-        except Exception as exc:
-            print(f"[tokoya] import failed: {exc!r}")
-            return False
-        obj = bpy.data.objects.get(_world_passthrough.TARGET_NAME)
-        if obj is None or obj.type != "CURVES":
-            print(f"[tokoya] start failed: '{_world_passthrough.TARGET_NAME}' not found or not Curves")
-            return False
-        if self._passthrough is None:
-            self._passthrough = _world_passthrough.WorldPassthrough()
-        return self._passthrough.start(obj, scene)
-
-    def teardown(self) -> None:
-        if self._passthrough is not None:
-            try:
-                self._passthrough.teardown()
-            except Exception:
-                pass
-        self._passthrough = None
-
-    def step(self, scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> None:
-        if self._passthrough is not None:
-            self._passthrough.step(scene)
-
-    def playback(self, scene: bpy.types.Scene) -> None:
-        if self._passthrough is not None:
-            self._passthrough.playback(scene)
-
-
-_solver = SolverInterface()
-
-
-# ---------------------------------------------------------------------------
-# Frame handler
-# ---------------------------------------------------------------------------
-
-@persistent
-def _on_frame_change_post(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph) -> None:
-    wm   = bpy.context.window_manager
-    if wm is None:
-        return
-    mode = getattr(wm, "tokoya_mode", MODE_BYPASS)
-    if   mode == MODE_SIMULATING:
-        _solver.step(scene, depsgraph)
-    elif mode == MODE_PLAYBACK:
-        _solver.playback(scene)
-
-
-def _install_handler() -> None:
-    if _on_frame_change_post not in bpy.app.handlers.frame_change_post:
-        bpy.app.handlers.frame_change_post.append(_on_frame_change_post)
-
-
-def _uninstall_handler() -> None:
-    if _on_frame_change_post in bpy.app.handlers.frame_change_post:
-        bpy.app.handlers.frame_change_post.remove(_on_frame_change_post)
-
-
-# ---------------------------------------------------------------------------
-# Operators
-# ---------------------------------------------------------------------------
-
-class TOKOYA_OT_start(Operator):
-    bl_idname    = "tokoya.start"
-    bl_label     = "Start"
-    bl_description = "Enter SIMULATING mode"
-
-    def execute(self, context: bpy.types.Context) -> set[str]:
+    def execute(self, context):
+        obj = _find_curves_obj()
+        if obj is None:
+            self.report({"ERROR"}, "Need exactly one Curves object"); return {"CANCELLED"}
         wm = context.window_manager
-        _snapshot_params(wm)
-        if not _solver.start(context.scene):
-            self.report({"ERROR"}, "Tokoya start failed (see system console)")
-            return {"CANCELLED"}
-        wm.tokoya_mode = MODE_SIMULATING
-        self.report({"INFO"}, "Tokoya → SIMULATING")
+        _snapshot_sim_params(wm)
+        from . import _world_passthrough as _wp
+        status = _wp.run_simulation(obj.name, int(wm.tokoya_n), context.scene)
+        if status.startswith("ERROR"):
+            self.report({"ERROR"}, status); return {"CANCELLED"}
+        self.report({"INFO"}, status)
         return {"FINISHED"}
 
 
-class TOKOYA_OT_stop(Operator):
-    bl_idname    = "tokoya.stop"
-    bl_label     = "Stop"
-    bl_description = "Enter PLAYBACK mode"
+class TOKOYA_OT_mesh_shrink(Operator):
+    bl_idname      = "tokoya.mesh_shrink"
+    bl_label       = "Mesh Shrink"
+    bl_description = ("Shrink strands to first intersection with Ref mesh. "
+                      "Plane=height-cut, half-sphere=round-cut.")
 
-    def execute(self, context: bpy.types.Context) -> set[str]:
-        wm = context.window_manager
-        wm.tokoya_mode = MODE_PLAYBACK
-        _solver.playback(context.scene)
-        self.report({"INFO"}, "Tokoya → PLAYBACK")
+    def execute(self, context):
+        obj = _find_curves_obj()
+        if obj is None:
+            self.report({"ERROR"}, "Need exactly one Curves object"); return {"CANCELLED"}
+        ref_name = context.window_manager.tokoya_ref_obj.strip()
+        ref = bpy.data.objects.get(ref_name)
+        if ref is None or ref.type != "MESH":
+            self.report({"ERROR"}, f"{ref_name!r} not found or not MESH"); return {"CANCELLED"}
+        from . import _mesh_ops
+        n = _mesh_ops.mesh_shrink(obj, ref)
+        self.report({"INFO"}, f"Shrunk {n} strands")
         return {"FINISHED"}
 
 
-class TOKOYA_OT_bypass(Operator):
-    bl_idname    = "tokoya.bypass"
-    bl_label     = "Bypass"
-    bl_description = "Enter BYPASS mode — extension does nothing"
+class TOKOYA_OT_mesh_extend(Operator):
+    bl_idname      = "tokoya.mesh_extend"
+    bl_label       = "Mesh Extend"
+    bl_description = "Extend strand tips to reach Ref mesh surface"
 
-    def execute(self, context: bpy.types.Context) -> set[str]:
-        wm = context.window_manager
-        wm.tokoya_mode = MODE_BYPASS
-        self.report({"INFO"}, "Tokoya → BYPASS")
+    def execute(self, context):
+        obj = _find_curves_obj()
+        if obj is None:
+            self.report({"ERROR"}, "Need exactly one Curves object"); return {"CANCELLED"}
+        ref_name = context.window_manager.tokoya_ref_obj.strip()
+        ref = bpy.data.objects.get(ref_name)
+        if ref is None or ref.type != "MESH":
+            self.report({"ERROR"}, f"{ref_name!r} not found or not MESH"); return {"CANCELLED"}
+        from . import _mesh_ops
+        n = _mesh_ops.mesh_extend(obj, ref)
+        self.report({"INFO"}, f"Extended {n} strands")
+        return {"FINISHED"}
+
+
+class TOKOYA_OT_urchin_reset(Operator):
+    bl_idname      = "tokoya.urchin_reset"
+    bl_label       = "Urchin Reset"
+    bl_description = "Reset all strands to straight radial lines (arc-length preserved)"
+
+    def execute(self, context):
+        obj = _find_curves_obj()
+        if obj is None:
+            self.report({"ERROR"}, "Need exactly one Curves object"); return {"CANCELLED"}
+        from . import _mesh_ops
+        n = _mesh_ops.urchin_reset(obj)
+        self.report({"INFO"}, f"Urchin reset: {n} strands")
         return {"FINISHED"}
 
 
 _classes = (
-    TOKOYA_OT_start,
-    TOKOYA_OT_stop,
-    TOKOYA_OT_bypass,
-    TOKOYA_OT_save_params,
-    TOKOYA_OT_load_params,
+    TOKOYA_OT_plant_hair,
+    TOKOYA_OT_extend,
+    TOKOYA_OT_simulate,
+    TOKOYA_OT_mesh_shrink,
+    TOKOYA_OT_mesh_extend,
+    TOKOYA_OT_urchin_reset,
 )
 
 
-# ---------------------------------------------------------------------------
-# Register / unregister
-# ---------------------------------------------------------------------------
-
-def register() -> None:
-    _defaults = _load_defaults_json()
+def register():
+    defaults = _load_defaults()
     for cls in _classes:
         bpy.utils.register_class(cls)
-    WindowManager.tokoya_mode = EnumProperty(
-        name    = "Tokoya Mode",
-        items   = [
-            (MODE_BYPASS,     "Bypass",     "Extension inactive"),
-            (MODE_SIMULATING, "Simulating", "Run sim on +1 frames; restore from bake on scrub"),
-            (MODE_PLAYBACK,   "Playback",   "Push baked state; no simulation"),
-        ],
-        default = MODE_BYPASS,
-        options = {"SKIP_SAVE"},
-    )
-    _register_param_props(_defaults)
+
+    WindowManager.tokoya_alpha = FloatProperty(
+        name="Radius a cm", description="Spiral radius for Plant Hair (cm)",
+        default=27.0, min=0.5, max=35.0, step=10, precision=1, options={"SKIP_SAVE"})
+    WindowManager.tokoya_beta = FloatProperty(
+        name="Spacing b cm", description="Root spacing for Plant Hair (cm)",
+        default=0.3, min=0.2, max=5.0, step=5, precision=2, options={"SKIP_SAVE"})
+    WindowManager.tokoya_n = FloatProperty(
+        name="N", description="Length cm (Extend) or Step count (Simulate)",
+        default=30.0, min=0.1, max=500.0, step=100, precision=1, options={"SKIP_SAVE"})
+    WindowManager.tokoya_ref_obj = StringProperty(
+        name="Ref Object", description="Empty (Plant) or Mesh (Shrink/Extend)",
+        default="", options={"SKIP_SAVE"})
+    WindowManager.tokoya_spring_ke = FloatProperty(
+        name="Stiffness 10^N", default=math.log10(defaults["SPRING_KE"]),
+        min=1.0, max=9.0, step=10, precision=2, options={"SKIP_SAVE"})
+    WindowManager.tokoya_damping = FloatProperty(
+        name="Damping /100", default=defaults["DAMPING"] * 100.0,
+        min=0.0, max=50.0, step=10, precision=1, options={"SKIP_SAVE"})
+    WindowManager.tokoya_particle_mass = FloatProperty(
+        name="Mass /1000", default=defaults["PARTICLE_MASS"] * 1000.0,
+        min=1.0, max=10000.0, step=100, precision=1, options={"SKIP_SAVE"})
+    WindowManager.tokoya_gravity = FloatProperty(
+        name="Gravity m/s2", default=defaults["GRAVITY"],
+        min=-20.0, max=0.0, step=10, precision=2, options={"SKIP_SAVE"})
+    WindowManager.tokoya_iterations = IntProperty(
+        name="Iterations", default=int(defaults["ITERATIONS"]),
+        min=1, max=64, options={"SKIP_SAVE"})
+    WindowManager.tokoya_substeps = IntProperty(
+        name="Substeps", default=int(defaults["SUBSTEPS"]),
+        min=1, max=16, options={"SKIP_SAVE"})
+    WindowManager.tokoya_bending_enabled = BoolProperty(
+        name="Bending", default=bool(defaults["BENDING_ENABLED"]),
+        options={"SKIP_SAVE"})
+    WindowManager.tokoya_root_bending_ke = FloatProperty(
+        name="Root Stiff 10^N", default=math.log10(defaults["ROOT_BENDING_KE"]),
+        min=0.0, max=7.0, step=10, precision=2, options={"SKIP_SAVE"})
+    WindowManager.tokoya_bending_ke = FloatProperty(
+        name="Strand Stiff 10^N", default=math.log10(defaults["BENDING_KE"]),
+        min=0.0, max=6.0, step=10, precision=2, options={"SKIP_SAVE"})
     ui.register()
-    _install_handler()
 
 
-def unregister() -> None:
-    try:
-        _solver.teardown()
-    except Exception:
-        pass
-    _uninstall_handler()
+def unregister():
     ui.unregister()
-    _unregister_param_props()
-    del WindowManager.tokoya_mode
+    for name in (
+        "tokoya_alpha", "tokoya_beta", "tokoya_n", "tokoya_ref_obj",
+        "tokoya_spring_ke", "tokoya_damping", "tokoya_particle_mass",
+        "tokoya_gravity", "tokoya_iterations", "tokoya_substeps",
+        "tokoya_bending_enabled", "tokoya_root_bending_ke", "tokoya_bending_ke",
+    ):
+        try: delattr(WindowManager, name)
+        except Exception: pass
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
