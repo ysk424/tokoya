@@ -144,6 +144,22 @@ class TOKOYA_OT_urchin_reset(Operator):
         return {"FINISHED"}
 
 
+class TOKOYA_OT_pick_ref(Operator):
+    """Set Ref Object from the currently active (selected) object in the viewport."""
+    bl_idname      = "tokoya.pick_ref"
+    bl_label       = "Pick Active as Ref"
+    bl_description = "Set Ref Object to the active viewport object (any type)"
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None:
+            self.report({"WARNING"}, "No active object in viewport")
+            return {"CANCELLED"}
+        context.window_manager.tokoya_ref_obj = obj.name
+        self.report({"INFO"}, f"Ref Object: {obj.name!r} ({obj.type})")
+        return {"FINISHED"}
+
+
 _classes = (
     TOKOYA_OT_plant_hair,
     TOKOYA_OT_extend,
@@ -151,6 +167,7 @@ _classes = (
     TOKOYA_OT_mesh_shrink,
     TOKOYA_OT_mesh_extend,
     TOKOYA_OT_urchin_reset,
+    TOKOYA_OT_pick_ref,
 )
 
 

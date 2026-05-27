@@ -41,8 +41,11 @@ class TOKOYA_PT_main(Panel):
         box.label(text="N  /  Ref Object")
         col = box.column(align=True)
         col.prop(wm, "tokoya_n")
+
+        # Ref Object row: [name field] [eyedropper←active] [type label]
         row = col.row(align=True)
-        row.prop_search(wm, "tokoya_ref_obj", bpy.data, "objects", text="")
+        row.prop(wm, "tokoya_ref_obj", text="")
+        row.operator("tokoya.pick_ref", text="", icon="EYEDROPPER")
         ref = bpy.data.objects.get(wm.tokoya_ref_obj.strip())
         row.label(text=ref.type if ref else "--")
 
