@@ -252,13 +252,13 @@ class WorldPassthrough:
                 bending_enabled = BENDING_ENABLED,
             )
             print(
-                f"[hair_sim/taichi] solver ready: "
+                f"[tokoya/taichi] solver ready: "
                 f"n={self._n_total}, strands={n_strands}, pps={POINTS_PER_STRAND}, "
                 f"ke={SPRING_KE}, damping={DAMPING}, iter={ITERATIONS}, sub={SUBSTEPS}"
             )
             return True
         except Exception as exc:
-            print(f"[hair_sim/taichi] solver build failed: {exc!r}")
+            print(f"[tokoya/taichi] solver build failed: {exc!r}")
             return False
 
     def _run_one_simulation_step(self, scene: bpy.types.Scene) -> bool:
@@ -318,9 +318,9 @@ class WorldPassthrough:
                         pred_np, _bvh, root_mask=_mask, margin=0.005
                     )
                     if n > 0:
-                        print(f"[hair_sim/collision] pushed {n} particles")
+                        print(f"[tokoya/collision] pushed {n} particles")
             else:
-                print(f"[hair_sim/collision] WARNING: BVH build failed for '{BODY_COLLISION_TARGET}'")
+                print(f"[tokoya/collision] WARNING: BVH build failed for '{BODY_COLLISION_TARGET}'")
 
         # Run XPBD on GPU (body collision integrated per substep).
         sim_out = self._taichi_solver.run_frame(
@@ -372,19 +372,19 @@ class WorldPassthrough:
         self._prev_state        = None
 
         if obj is None or obj.type != "CURVES":
-            print(f"[hair_sim] start failed: target must be CURVES (got {obj})")
+            print(f"[tokoya] start failed: target must be CURVES (got {obj})")
             return False
         attr = obj.data.attributes.get("position")
         if attr is None:
-            print("[hair_sim] start failed: no 'position' attribute on target")
+            print("[tokoya] start failed: no 'position' attribute on target")
             return False
         n_total = len(attr.data)
         if n_total == 0:
-            print(f"[hair_sim] start failed: empty Curves")
+            print(f"[tokoya] start failed: empty Curves")
             return False
         if n_total % POINTS_PER_STRAND != 0:
             print(
-                f"[hair_sim] start failed: n_total ({n_total}) not divisible "
+                f"[tokoya] start failed: n_total ({n_total}) not divisible "
                 f"by POINTS_PER_STRAND ({POINTS_PER_STRAND})"
             )
             return False
@@ -392,7 +392,7 @@ class WorldPassthrough:
         fs, fe, fc = int(scene.frame_start), int(scene.frame_end), int(scene.frame_current)
         if fc < fs or fc > fe:
             print(
-                f"[hair_sim] start failed: frame {fc} outside range [{fs}..{fe}]"
+                f"[tokoya] start failed: frame {fc} outside range [{fs}..{fe}]"
             )
             return False
 
@@ -411,7 +411,7 @@ class WorldPassthrough:
         self._allocate_bake(scene)
 
         if not self._capture_current_state(scene, derive_velocity_from_prev=False):
-            print("[hair_sim] start failed: initial capture returned no state")
+            print("[tokoya] start failed: initial capture returned no state")
             self._initialized = False
             return False
         self._store_prev_state_to_bake()
@@ -420,7 +420,7 @@ class WorldPassthrough:
         bake_mb  = (self._bake_positions.nbytes / (1024 * 1024)
                     if self._bake_positions is not None else 0)
         print(
-            f"[hair_sim] start ok: target={obj.name!r}, n_total={n_total}, "
+            f"[tokoya] start ok: target={obj.name!r}, n_total={n_total}, "
             f"frame={self._last_frame}, "
             f"bake=[{self._bake_frame_start}..{self._bake_frame_end}] "
             f"({n_frames} frames, ~{bake_mb:.0f} MB × 2)"
@@ -478,7 +478,7 @@ class WorldPassthrough:
             return True
         except Exception as exc:
             self._step_error_active = True
-            print(f"[hair_sim] step error (suppressing): {exc!r}")
+            print(f"[tokoya] step error (suppressing): {exc!r}")
             return False
 
     def playback(self, scene: bpy.types.Scene) -> bool:
@@ -493,7 +493,7 @@ class WorldPassthrough:
             self._restore_from_bake(M)
             return True
         except Exception as exc:
-            print(f"[hair_sim] playback error (suppressing): {exc!r}")
+            print(f"[tokoya] playback error (suppressing): {exc!r}")
             return False
 
     # ------------------------------------------------------------------ #

@@ -20,7 +20,7 @@ MODE_PLAYBACK   = "PLAYBACK"
 # ---------------------------------------------------------------------------
 # Parameter definitions
 #
-# All values in hair_sim_defaults.json and _world_passthrough.py are
+# All values in tokoya_defaults.json and _world_passthrough.py are
 # PHYSICS values. WM properties store USER-FRIENDLY display values:
 #
 #   SPRING_KE / ROOT_BENDING_KE / BENDING_KE : log10(physics)
@@ -101,16 +101,16 @@ _ALL_KEYS = _PARAM_FLOAT_KEYS + _PARAM_INT_KEYS + _PARAM_BOOL_KEYS + _PARAM_STR_
 
 
 def _wm_attr(key: str) -> str:
-    return "hair_sim_param_" + key.lower()
+    return "tokoya_param_" + key.lower()
 
 
 def _load_defaults_json() -> dict:
-    path = os.path.join(os.path.dirname(__file__), "hair_sim_defaults.json")
+    path = os.path.join(os.path.dirname(__file__), "tokoya_defaults.json")
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     missing = [k for k in _ALL_KEYS if k not in data]
     if missing:
-        raise RuntimeError(f"hair_sim_defaults.json missing keys: {missing}")
+        raise RuntimeError(f"tokoya_defaults.json missing keys: {missing}")
     return data
 
 
@@ -173,18 +173,18 @@ def _snapshot_params(wm: bpy.types.WindowManager) -> None:
     phys_vals = ", ".join(
         f"{k}={getattr(_wp, k):.4g}" for k in _PARAM_FLOAT_KEYS
     )
-    print(f"[hair_sim] params (physics): {phys_vals}")
+    print(f"[tokoya] params (physics): {phys_vals}")
 
 
 # ---------------------------------------------------------------------------
 # Save / Load preset operators
 # ---------------------------------------------------------------------------
 
-class HAIR_SIM_OT_save_params(Operator):
-    bl_idname    = "hair_sim.save_params"
+class TOKOYA_OT_save_params(Operator):
+    bl_idname    = "tokoya.save_params"
     bl_label     = "Save Params"
     bl_description = "Save current parameters to a JSON preset file"
-    filepath: StringProperty(subtype="FILE_PATH", default="katsura_params.json")
+    filepath: StringProperty(subtype="FILE_PATH", default="tokoya_params.json")
 
     def invoke(self, context, event):
         context.window_manager.fileselect_add(self)
@@ -207,8 +207,8 @@ class HAIR_SIM_OT_save_params(Operator):
         return {"FINISHED"}
 
 
-class HAIR_SIM_OT_load_params(Operator):
-    bl_idname    = "hair_sim.load_params"
+class TOKOYA_OT_load_params(Operator):
+    bl_idname    = "tokoya.load_params"
     bl_label     = "Load Params"
     bl_description = "Load parameters from a JSON preset file"
     filepath: StringProperty(subtype="FILE_PATH")
@@ -251,11 +251,11 @@ class SolverInterface:
         try:
             from . import _world_passthrough
         except Exception as exc:
-            print(f"[hair_sim] import failed: {exc!r}")
+            print(f"[tokoya] import failed: {exc!r}")
             return False
         obj = bpy.data.objects.get(_world_passthrough.TARGET_NAME)
         if obj is None or obj.type != "CURVES":
-            print(f"[hair_sim] start failed: '{_world_passthrough.TARGET_NAME}' not found or not Curves")
+            print(f"[tokoya] start failed: '{_world_passthrough.TARGET_NAME}' not found or not Curves")
             return False
         if self._passthrough is None:
             self._passthrough = _world_passthrough.WorldPassthrough()
@@ -290,7 +290,7 @@ def _on_frame_change_post(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph
     wm   = bpy.context.window_manager
     if wm is None:
         return
-    mode = getattr(wm, "hair_sim_mode", MODE_BYPASS)
+    mode = getattr(wm, "tokoya_mode", MODE_BYPASS)
     if   mode == MODE_SIMULATING:
         _solver.step(scene, depsgraph)
     elif mode == MODE_PLAYBACK:
@@ -311,8 +311,8 @@ def _uninstall_handler() -> None:
 # Operators
 # ---------------------------------------------------------------------------
 
-class HAIR_SIM_OT_start(Operator):
-    bl_idname    = "hair_sim.start"
+class TOKOYA_OT_start(Operator):
+    bl_idname    = "tokoya.start"
     bl_label     = "Start"
     bl_description = "Enter SIMULATING mode"
 
@@ -320,44 +320,44 @@ class HAIR_SIM_OT_start(Operator):
         wm = context.window_manager
         _snapshot_params(wm)
         if not _solver.start(context.scene):
-            self.report({"ERROR"}, "Hair sim start failed (see system console)")
+            self.report({"ERROR"}, "Tokoya start failed (see system console)")
             return {"CANCELLED"}
-        wm.hair_sim_mode = MODE_SIMULATING
-        self.report({"INFO"}, "Hair sim → SIMULATING")
+        wm.tokoya_mode = MODE_SIMULATING
+        self.report({"INFO"}, "Tokoya → SIMULATING")
         return {"FINISHED"}
 
 
-class HAIR_SIM_OT_stop(Operator):
-    bl_idname    = "hair_sim.stop"
+class TOKOYA_OT_stop(Operator):
+    bl_idname    = "tokoya.stop"
     bl_label     = "Stop"
     bl_description = "Enter PLAYBACK mode"
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         wm = context.window_manager
-        wm.hair_sim_mode = MODE_PLAYBACK
+        wm.tokoya_mode = MODE_PLAYBACK
         _solver.playback(context.scene)
-        self.report({"INFO"}, "Hair sim → PLAYBACK")
+        self.report({"INFO"}, "Tokoya → PLAYBACK")
         return {"FINISHED"}
 
 
-class HAIR_SIM_OT_bypass(Operator):
-    bl_idname    = "hair_sim.bypass"
+class TOKOYA_OT_bypass(Operator):
+    bl_idname    = "tokoya.bypass"
     bl_label     = "Bypass"
     bl_description = "Enter BYPASS mode — extension does nothing"
 
     def execute(self, context: bpy.types.Context) -> set[str]:
         wm = context.window_manager
-        wm.hair_sim_mode = MODE_BYPASS
-        self.report({"INFO"}, "Hair sim → BYPASS")
+        wm.tokoya_mode = MODE_BYPASS
+        self.report({"INFO"}, "Tokoya → BYPASS")
         return {"FINISHED"}
 
 
 _classes = (
-    HAIR_SIM_OT_start,
-    HAIR_SIM_OT_stop,
-    HAIR_SIM_OT_bypass,
-    HAIR_SIM_OT_save_params,
-    HAIR_SIM_OT_load_params,
+    TOKOYA_OT_start,
+    TOKOYA_OT_stop,
+    TOKOYA_OT_bypass,
+    TOKOYA_OT_save_params,
+    TOKOYA_OT_load_params,
 )
 
 
@@ -369,8 +369,8 @@ def register() -> None:
     _defaults = _load_defaults_json()
     for cls in _classes:
         bpy.utils.register_class(cls)
-    WindowManager.hair_sim_mode = EnumProperty(
-        name    = "Hair Sim Mode",
+    WindowManager.tokoya_mode = EnumProperty(
+        name    = "Tokoya Mode",
         items   = [
             (MODE_BYPASS,     "Bypass",     "Extension inactive"),
             (MODE_SIMULATING, "Simulating", "Run sim on +1 frames; restore from bake on scrub"),
@@ -392,6 +392,6 @@ def unregister() -> None:
     _uninstall_handler()
     ui.unregister()
     _unregister_param_props()
-    del WindowManager.hair_sim_mode
+    del WindowManager.tokoya_mode
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

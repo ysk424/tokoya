@@ -1,4 +1,4 @@
-"""3D View N-panel — Katsura Hair Simulation."""
+"""3D View N-panel — Tokoya Simulation."""
 from __future__ import annotations
 
 import math
@@ -23,17 +23,17 @@ def _get_actual_label(key: str, disp_val: float) -> str:
     return ""
 
 
-class HAIR_SIM_PT_main(Panel):
-    bl_idname      = "HAIR_SIM_PT_main"
-    bl_label       = "Katsura"
+class TOKOYA_PT_main(Panel):
+    bl_idname      = "TOKOYA_PT_main"
+    bl_label       = "Tokoya"
     bl_space_type  = "VIEW_3D"
     bl_region_type = "UI"
-    bl_category    = "Katsura"
+    bl_category    = "Tokoya"
 
     def draw(self, context: bpy.types.Context) -> None:
         layout = self.layout
         wm     = context.window_manager
-        mode   = getattr(wm, "hair_sim_mode", "BYPASS")
+        mode   = getattr(wm, "tokoya_mode", "BYPASS")
 
         # ---- Header: name + version ----
         try:
@@ -44,23 +44,23 @@ class HAIR_SIM_PT_main(Panel):
         except Exception:
             version = "?"
         row = layout.row()
-        row.label(text=f"Katsura  v{version}")
+        row.label(text=f"Tokoya  v{version}")
 
         # ---- Mode buttons ----
         row = layout.row(align=True)
-        row.operator("hair_sim.start",  text="Start",  icon="PLAY",
+        row.operator("tokoya.start",  text="Start",  icon="PLAY",
                      depress=(mode == "SIMULATING"))
-        row.operator("hair_sim.stop",   text="Stop",   icon="PAUSE",
+        row.operator("tokoya.stop",   text="Stop",   icon="PAUSE",
                      depress=(mode == "PLAYBACK"))
-        row.operator("hair_sim.bypass", text="Bypass", icon="FILE_REFRESH",
+        row.operator("tokoya.bypass", text="Bypass", icon="FILE_REFRESH",
                      depress=(mode == "BYPASS"))
 
         layout.label(text=f"Mode: {mode}")
 
         # ---- Save / Load preset ----
         row = layout.row(align=True)
-        row.operator("hair_sim.save_params", text="Save Params", icon="FILE_TICK")
-        row.operator("hair_sim.load_params", text="Load Params", icon="FILE_FOLDER")
+        row.operator("tokoya.save_params", text="Save Params", icon="FILE_TICK")
+        row.operator("tokoya.load_params", text="Load Params", icon="FILE_FOLDER")
 
         layout.separator(factor=0.5)
         layout.label(text="Params (applied at next Start):")
@@ -70,7 +70,7 @@ class HAIR_SIM_PT_main(Panel):
         box.label(text="Dynamics")
         col = box.column(align=True)
         for key in ("SPRING_KE", "DAMPING", "PARTICLE_MASS", "GRAVITY"):
-            attr = "hair_sim_param_" + key.lower()
+            attr = "tokoya_param_" + key.lower()
             if hasattr(wm, attr):
                 disp_val = getattr(wm, attr)
                 actual   = _get_actual_label(key, disp_val)
@@ -86,18 +86,18 @@ class HAIR_SIM_PT_main(Panel):
         box.label(text="Solver")
         col = box.column(align=True)
         for key in ("ITERATIONS", "SUBSTEPS"):
-            attr = "hair_sim_param_" + key.lower()
+            attr = "tokoya_param_" + key.lower()
             if hasattr(wm, attr):
                 col.prop(wm, attr)
 
         # ---- Bending ----
         box = layout.box()
-        bend_attr = "hair_sim_param_bending_enabled"
+        bend_attr = "tokoya_param_bending_enabled"
         box.prop(wm, bend_attr, text="Bending")
         if getattr(wm, bend_attr, False):
             col = box.column(align=True)
             for key in ("ROOT_BENDING_KE", "BENDING_KE"):
-                attr = "hair_sim_param_" + key.lower()
+                attr = "tokoya_param_" + key.lower()
                 if hasattr(wm, attr):
                     disp_val = getattr(wm, attr)
                     actual   = _get_actual_label(key, disp_val)
@@ -107,15 +107,15 @@ class HAIR_SIM_PT_main(Panel):
 
         # ---- Collision ----
         box = layout.box()
-        coll_attr = "hair_sim_param_body_collision_enabled"
+        coll_attr = "tokoya_param_body_collision_enabled"
         box.prop(wm, coll_attr, text="Body Collision")
         if getattr(wm, coll_attr, False):
-            tgt_attr = "hair_sim_param_body_collision_target"
+            tgt_attr = "tokoya_param_body_collision_target"
             if hasattr(wm, tgt_attr):
                 box.prop(wm, tgt_attr, text="Target")
 
 
-_classes = (HAIR_SIM_PT_main,)
+_classes = (TOKOYA_PT_main,)
 
 
 def register() -> None:

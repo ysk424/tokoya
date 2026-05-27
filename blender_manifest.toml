@@ -1,8 +1,8 @@
 schema_version = "1.0.0"
 
-id = "hair_sim_physx"
+id = "tokoya"
 version = "0.1.1"
-name = "Katsura"
+name = "Tokoya"
 tagline = "Hair physics simulation — Taichi XPBD"
 maintainer = "Yoshihiko Tsukamoto <ysk424@hotmail.com>"
 type = "add-on"
@@ -21,5 +21,5 @@ paths = [
     "ui.py",
     "_world_passthrough.py",
     "_sim_taichi.py",
-    "hair_sim_defaults.json",
+    "tokoya_defaults.json",
 ]

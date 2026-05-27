@@ -26,11 +26,11 @@ def _ensure_taichi():
     import taichi as ti
     try:
         ti.init(arch=ti.cuda, device_memory_fraction=0.5)
-        print("[hair_sim/taichi] CUDA initialized (sm_120 OK)")
+        print("[tokoya/taichi] CUDA initialized (sm_120 OK)")
     except Exception as e:
-        print(f"[hair_sim/taichi] CUDA failed ({e}), falling back to CPU")
+        print(f"[tokoya/taichi] CUDA failed ({e}), falling back to CPU")
         ti.init(arch=ti.cpu)
-        print("[hair_sim/taichi] CPU initialized")
+        print("[tokoya/taichi] CPU initialized")
     _ti = ti
     return ti
 
