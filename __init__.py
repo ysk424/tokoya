@@ -74,7 +74,8 @@ class TOKOYA_OT_extend(Operator):
 class TOKOYA_OT_simulate(Operator):
     bl_idname      = "tokoya.simulate"
     bl_label       = "Simulate"
-    bl_description = "Run N steps of Taichi XPBD. Body vs CC_Base_Body. N = number field"
+    bl_description = ("Run N steps of Taichi XPBD. "
+                      "If Ref Object is a closed mesh, strands inside are frozen.")
 
     def execute(self, context):
         obj = _find_curves_obj()
@@ -82,8 +83,30 @@ class TOKOYA_OT_simulate(Operator):
             self.report({"ERROR"}, "Need exactly one Curves object"); return {"CANCELLED"}
         wm = context.window_manager
         _snapshot_sim_params(wm)
+
+        # Compute protected strand indices when Ref Object is a closed mesh
+        protected_indices = None
+        ref_name = wm.tokoya_ref_obj.strip()
+        if ref_name:
+            ref = bpy.data.objects.get(ref_name)
+            if ref is not None and ref.type == "MESH":
+                from . import _mesh_ops as _mo
+                from mathutils import Vector
+                import numpy as _np
+                if _mo._is_closed_mesh(ref):
+                    bvh   = _mo._build_bvh(ref)
+                    world = _mo._read_world_eval(obj)
+                    n_c   = len(world) // _mo._PPC
+                    prot  = [ci for ci in range(n_c)
+                             if _mo._is_inside_mesh(Vector(world[ci * _mo._PPC].tolist()), bvh)]
+                    if prot:
+                        protected_indices = _np.array(prot, dtype=_np.int32)
+                        self.report({"INFO"},
+                            f"Protecting {len(prot)} strands inside {ref_name!r}")
+
         from . import _world_passthrough as _wp
-        status = _wp.run_simulation(obj.name, int(wm.tokoya_n), context.scene)
+        status = _wp.run_simulation(obj.name, int(wm.tokoya_n), context.scene,
+                                    protected_indices=protected_indices)
         if status.startswith("ERROR"):
             self.report({"ERROR"}, status); return {"CANCELLED"}
         self.report({"INFO"}, status)
@@ -117,23 +140,30 @@ class TOKOYA_OT_mesh_shrink(Operator):
 class TOKOYA_OT_mesh_extend(Operator):
     bl_idname      = "tokoya.mesh_extend"
     bl_label       = "Mesh Extend"
-    bl_description = "Extend strand tips to reach Ref mesh surface"
+    bl_description = ("Set strands inside closed Ref mesh to N cm. "
+                      "Short strands are extended; long strands are shrunk. N = number field.")
 
     def execute(self, context):
         obj = _find_curves_obj()
         if obj is None:
             self.report({"ERROR"}, "Need exactly one Curves object"); return {"CANCELLED"}
-        ref_name = context.window_manager.tokoya_ref_obj.strip()
+        wm = context.window_manager
+        ref_name = wm.tokoya_ref_obj.strip()
         ref = bpy.data.objects.get(ref_name)
         if ref is None or ref.type != "MESH":
             t = ref.type if ref else "not found"
             self.report({"ERROR"},
-                f"Ref Object must be MESH (got {t}). "
-                "Use UV Sphere / Plane — not Curve objects.")
+                f"Ref Object must be a closed MESH (got {t}). "
+                "Use UV Sphere or similar — not open meshes or Curve objects.")
             return {"CANCELLED"}
         from . import _mesh_ops
-        n = _mesh_ops.mesh_extend(obj, ref)
-        self.report({"INFO"}, f"Extended {n} strands")
+        target_m = wm.tokoya_n / 100.0
+        n = _mesh_ops.mesh_extend_protected(obj, ref, target_m)
+        if n == 0:
+            self.report({"WARNING"},
+                f"{ref_name!r} is not a closed mesh, or no strands found inside.")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Set {n} strands to {wm.tokoya_n:.1f} cm")
         return {"FINISHED"}
 
 

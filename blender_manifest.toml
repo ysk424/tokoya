@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "tokoya"
-version = "0.2.0"
+version = "0.2.6"
 name = "Tokoya"
 tagline = "Barber tool — plant, drape, cut hair with Taichi XPBD"
 maintainer = "Yoshihiko Tsukamoto <ysk424@hotmail.com>"

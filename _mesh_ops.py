@@ -10,13 +10,13 @@ Coordinate convention
 
 Operations
 ----------
-extend_length  : scale all strands to a target arc-length (bigger urchin).
-mesh_shrink    : proportionally shrink strands to their first mesh intersection
-                 (walking segments from root toward tip, bidirectional ray cast).
-mesh_extend    : extend strands whose root→tip ray hits the mesh BEYOND the
-                 current tip (short strands grow to fill the mesh boundary).
-urchin_reset   : redistribute all strand points along root-normal direction
-                 (arc-length preserved).
+extend_length        : scale all strands to a target arc-length (bigger urchin).
+mesh_shrink          : proportionally shrink strands to their first mesh intersection
+                       (walking segments from root toward tip, bidirectional ray cast).
+mesh_extend_protected: set strands whose root is INSIDE a closed primitive to target length
+                       (extends short strands, shrinks long ones — uniform N cm cut).
+urchin_reset         : redistribute all strand points along root-normal direction
+                       (arc-length preserved).
 """
 from __future__ import annotations
 
@@ -78,6 +78,37 @@ def _build_bvh(ref_mesh_obj: bpy.types.Object) -> BVHTree:
     bvh      = BVHTree.FromPolygons(verts_w, polys)
     eval_obj.to_mesh_clear()
     return bvh
+
+
+def _is_closed_mesh(ref_mesh_obj: bpy.types.Object) -> bool:
+    """Return True if the evaluated mesh has no open boundary edges."""
+    deps     = bpy.context.evaluated_depsgraph_get()
+    eval_obj = ref_mesh_obj.evaluated_get(deps)
+    mesh     = eval_obj.to_mesh()
+    edge_count: dict = {}
+    for poly in mesh.polygons:
+        for key in poly.edge_keys:
+            edge_count[key] = edge_count.get(key, 0) + 1
+    eval_obj.to_mesh_clear()
+    return bool(edge_count) and all(v >= 2 for v in edge_count.values())
+
+
+def _is_inside_mesh(point_w: Vector, bvh: BVHTree) -> bool:
+    """Ray counting inside/outside test for a closed mesh.
+
+    Cast a ray in +Z; count intersections. Odd = inside, even = outside.
+    Works for convex and concave closed meshes.
+    """
+    direction = Vector((0.0, 0.0, 1.0))
+    count  = 0
+    origin = point_w.copy()
+    for _ in range(64):  # safety cap
+        loc, _, _, _ = bvh.ray_cast(origin, direction)
+        if loc is None:
+            break
+        count += 1
+        origin = loc + direction * 1e-4
+    return (count % 2) == 1
 
 
 def _arc_length(pts_3d: np.ndarray) -> float:
@@ -194,75 +225,41 @@ def mesh_shrink(curves_obj: bpy.types.Object, ref_mesh_obj: bpy.types.Object) ->
     return shrunk
 
 
-def mesh_extend(curves_obj: bpy.types.Object, ref_mesh_obj: bpy.types.Object) -> int:
-    """Extend strands that do NOT yet reach the ref_mesh boundary.
+def mesh_extend_protected(curves_obj: bpy.types.Object,
+                          ref_mesh_obj: bpy.types.Object,
+                          target_m: float) -> int:
+    """Set strands whose root is INSIDE a closed primitive to exactly target_m.
 
-    Algorithm
-    ---------
-    For each strand, cast a ray from ROOT in the ROOT→TIP direction,
-    extended well beyond the current tip.
+    Strands shorter than target_m are extended; longer ones are shrunk.
+    Strands whose root is outside the primitive are left unchanged.
 
-    - If the mesh intersection is BEYOND the current tip: extend to it.
-    - If the mesh intersection is AT or BEFORE the current tip: skip
-      (the strand already reaches or crosses the mesh — use Mesh Shrink).
-    - No intersection: skip.
-
-    Uses EVALUATED world positions for correct intersection with the
-    Surface Deform modifier active.
-
-    Returns number of strands extended.
+    Requires a CLOSED mesh (no boundary edges).  Returns 0 if the mesh is open.
+    Returns number of strands modified.
     """
+    if not _is_closed_mesh(ref_mesh_obj):
+        return 0
     bvh   = _build_bvh(ref_mesh_obj)
     local = _read_local(curves_obj)
-    world = _read_world_eval(curves_obj)   # ← evaluated
+    world = _read_world_eval(curves_obj)
     n_c   = len(local) // _PPC
-    ext   = 0
+    mod   = 0
 
     for ci in range(n_c):
         b      = ci * _PPC
-        root_w = Vector(world[b          ].tolist())
-        tip_w  = Vector(world[b + _PPC - 1].tolist())
-
-        rtt     = tip_w - root_w
-        rtt_len = rtt.length
-        if rtt_len < 1e-6:
+        root_w = Vector(world[b].tolist())
+        if not _is_inside_mesh(root_w, bvh):
             continue
-        rtt_dir = rtt.normalized()
-
-        # Compute total arc length in evaluated space
-        total_arc = 0.0
-        for j in range(1, _PPC):
-            total_arc += float(np.linalg.norm(world[b + j] - world[b + j - 1]))
-        if total_arc < 1e-6:
+        cur = _arc_length(local[b:b + _PPC])
+        if cur < 1e-6:
             continue
-
-        # Cast from root in root→tip direction, searching up to 2 m beyond tip
-        search = rtt_len + 2.0
-        loc, _, _, dist_f = bvh.ray_cast(root_w, rtt_dir, search)
-        if loc is None:
-            # Reverse direction: cast from beyond-tip back toward root
-            far_pt = root_w + rtt_dir * search
-            loc_r, _, _, dist_r = bvh.ray_cast(far_pt, -rtt_dir, search)
-            if loc_r is not None:
-                dist_f = search - dist_r
-            else:
-                continue  # no intersection at all
-
-        if dist_f <= rtt_len:
-            continue  # intersection is at or before tip → don't extend here
-
-        # dist_f is the straight-line distance from root to intersection.
-        # Scale so the tip reaches that point.
-        # scale = dist_f / rtt_len  (straight-line ratio, same as arc-length ratio
-        #                             for nearly-straight strands)
-        scale = dist_f / rtt_len
+        scale  = target_m / cur
         root_l = local[b].copy()
         for j in range(1, _PPC):
             local[b + j] = root_l + (local[b + j] - root_l) * scale
-        ext += 1
+        mod += 1
 
     _write_local(curves_obj, local)
-    return ext
+    return mod
 
 
 def urchin_reset(curves_obj: bpy.types.Object) -> int:

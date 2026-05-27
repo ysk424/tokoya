@@ -66,7 +66,7 @@ def _write_world(obj, world_pts: np.ndarray,
 
 
 def run_simulation(curves_obj_name: str, n_steps: int,
-                   scene) -> str:
+                   scene, protected_indices=None) -> str:
     import sys
     if _PYTHON_USER_SITE not in sys.path:
         sys.path.insert(0, _PYTHON_USER_SITE)
@@ -99,6 +99,17 @@ def run_simulation(curves_obj_name: str, n_steps: int,
 
     curr_world = eval_w.copy()
     curr_vel   = np.zeros_like(curr_world)
+
+    # Build frozen mask for protected strands (all points of those strands stay fixed)
+    prot_mask = np.zeros(n_total, dtype=bool)
+    if protected_indices is not None and len(protected_indices) > 0:
+        for si in protected_indices:
+            b = int(si) * POINTS_PER_STRAND
+            prot_mask[b:b + POINTS_PER_STRAND] = True
+    prot_init = eval_w[prot_mask].copy() if prot_mask.any() else None
+    n_prot    = int(prot_mask.sum()) // POINTS_PER_STRAND
+    if n_prot > 0:
+        print(f'[tokoya/sim] {n_prot} strands protected (frozen inside primitive)')
 
     try:
         from . import _sim_taichi
@@ -151,6 +162,9 @@ def run_simulation(curves_obj_name: str, n_steps: int,
         )
         curr_vel   = solver.get_velocities_numpy()
         curr_world = sim_out
+        if prot_init is not None:
+            curr_world[prot_mask] = prot_init
+            curr_vel[prot_mask]   = 0.0
 
     _write_world(obj, curr_world, offset=offset_w)
     print(f'[tokoya/sim] done')
