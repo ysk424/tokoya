@@ -103,7 +103,11 @@ class TOKOYA_OT_mesh_shrink(Operator):
         ref_name = context.window_manager.tokoya_ref_obj.strip()
         ref = bpy.data.objects.get(ref_name)
         if ref is None or ref.type != "MESH":
-            self.report({"ERROR"}, f"{ref_name!r} not found or not MESH"); return {"CANCELLED"}
+            t = ref.type if ref else "not found"
+            self.report({"ERROR"},
+                f"Ref Object must be MESH (got {t}). "
+                "Ellipse/Circle are CURVE — use UV Sphere scaled to ellipsoid instead.")
+            return {"CANCELLED"}
         from . import _mesh_ops
         n = _mesh_ops.mesh_shrink(obj, ref)
         self.report({"INFO"}, f"Shrunk {n} strands")
@@ -122,7 +126,11 @@ class TOKOYA_OT_mesh_extend(Operator):
         ref_name = context.window_manager.tokoya_ref_obj.strip()
         ref = bpy.data.objects.get(ref_name)
         if ref is None or ref.type != "MESH":
-            self.report({"ERROR"}, f"{ref_name!r} not found or not MESH"); return {"CANCELLED"}
+            t = ref.type if ref else "not found"
+            self.report({"ERROR"},
+                f"Ref Object must be MESH (got {t}). "
+                "Use UV Sphere / Plane — not Curve objects.")
+            return {"CANCELLED"}
         from . import _mesh_ops
         n = _mesh_ops.mesh_extend(obj, ref)
         self.report({"INFO"}, f"Extended {n} strands")
