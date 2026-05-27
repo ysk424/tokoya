@@ -1,142 +1,231 @@
-# Project Working Notes (for future Claude Code sessions)
+# Tokoya — Project Working Notes
 
-This file is a handoff log. Read it before doing anything in this repository.
-Treat it as a living context document, updated when phases close.
+This file is a handoff log for Claude Code sessions.
+**Read this first** before touching anything in this repo.
 
 ---
 
-## ⚠️ START HERE — Katsura v0.1.1 (2026-05-27)
+## ⚠️ START HERE — Tokoya v0.2.5 (2026-05-27夜)
 
-**Active branch: `vbd-features-applied`** HEAD = `d1603c6`  
-**Install zip**: `dist/hair_sim_physx-0.1.1.zip` (user-validated)  
-**N-panel tab**: "Katsura" (not "HairSim")
+**This repo**: `C:\Users\azoo\git\blender-tokoya-extension\`  
+**Active branch**: `vbd-features-applied` HEAD = `f6efff8`  
+**Install zip**: `dist/tokoya-0.2.5.zip` — 最後にユーザー確認済み（動作レベル ✅）  
+**N-panel tab**: "Tokoya"  
+**Blender**: 5.1, Windows x64, RTX 5070 Ti (CUDA sm_120)
 
-### Architecture (v0.1.1)
+### このプロジェクトは何か
 
-```
-_sim_taichi.py        — Taichi XPBD solver (CUDA sm_120 RTX 5070 Ti)
-_world_passthrough.py — state mgmt + RAM bake + Taichi integration
-__init__.py           — WM props + param conversion + operators
-ui.py                 — Katsura N-panel (bl_category="Katsura")
-hair_sim_defaults.json — physics-value defaults (NOT display values)
-blender_manifest.toml — version=0.1.1, name=Katsura
-```
+**床屋（Tokoya）**: 美容師向け Blender 5.1 ヘアー制作ツール。  
+数学的に美しいヘアーをボタン操作だけで作る。最後の仕上げは Blender スカルプトで。
 
-### What works in v0.1.1
+**Katsura との違い**:
 
-1. **Taichi XPBD** on CUDA sm_120 Blackwell (RTX 5070 Ti) — CPU fallback available
-2. **Gravity drape** — natural hair behavior
-3. **Body collision** — CC_Base_Body, BVHTree, substep-integrated (4× per frame)
-4. **Follicle anchor** — point 0 AND point 1 kinematic; first segment locked to
-   scalp growth direction (mimics hair follicle embedded in skin)
-5. **Katsura panel** — log-scale input, ×100/÷1000 scaled inputs, actual-value display
-6. **Save/Load Params** — file browser JSON preset (physics values)
-
-### Parameter display ↔ physics conversions
-
-| WM attr | Display | Physics conversion |
-|---|---|---|
-| `hair_sim_param_spring_ke` | 4.00 | 10^4.00 = 10,000 |
-| `hair_sim_param_damping` | 1.0 | 1.0 / 100 = 0.01 |
-| `hair_sim_param_particle_mass` | 1000 | 1000 / 1000 = 1.0 kg |
-| `hair_sim_param_gravity` | -9.81 | -9.81 (no conversion) |
-| `hair_sim_param_root_bending_ke` | 3.30 | 10^3.30 ≈ 2,000 |
-| `hair_sim_param_bending_ke` | 1.00 | 10^1.00 = 10 |
-
-Conversions applied in `_snapshot_params()` at each Start.
-
-### Performance (YOKO__EXT_TEST.blend, 35,792 particles)
-
-| Config | ms/frame |
+| Katsura | Tokoya |
 |---|---|
-| XPBD GPU, collision OFF | ~104ms |
-| XPBD GPU + BVHTree collision | ~1000ms |
+| アニメーション物理シミュレーション | 1フレーム静的スタイリング |
+| frame_change_post ハンドラ有り | ハンドラなし |
+| RAM ベイクバッファ有り | バッファなし |
+| BYPASS/SIMULATING/PLAYBACK モード | モード概念なし |
+| 35,792粒子リアルタイム | ボタンを押すたびN回実行 |
 
-Bottleneck: Python BVHTree × 4 substeps × 35,792 particles (~900ms).
+---
 
-### Known issues / next priorities (user thinking about v0.2.0)
+## アーキテクチャ (v0.2.5)
 
-1. **Hair tunneling through head** — fast head movement causes strands to
-   pass through skull. Cause: `find_nearest` can't detect path intersections.
-   Fix: CCD ray_cast, or Warp-side detection. Follicle fix (point 1 kinematic)
-   may reduce frequency. User deferred this.
+```
+_sim_taichi.py        — Taichi XPBD ソルバー（Katsura から無改変）
+_world_passthrough.py — シングルショット run_simulation(name, n_steps, scene)
+_spiral_plant.py      — Vogel螺旋植毛（spiral-hair-build v5 から改造）
+_mesh_ops.py          — 幾何学操作（shrink/extend/urchin_reset/extend_length）
+__init__.py           — 6オペレーター + WMプロパティ登録
+ui.py                 — Tokoya N-パネル
+tokoya_defaults.json  — 物理パラメーターデフォルト
+blender_manifest.toml — version=0.2.5（次回インストール時にバンプ必須）
+```
 
-2. **Collision performance** — ~900ms Python BVH per frame.
-   Fix: move collision to Taichi GPU side. Target: <100ms total.
+### WM プロパティ一覧
 
-3. **v0.2.0 ideas** (user considering):
-   - Clothing simulation (architecture is generic enough)
-   - Collision GPU acceleration
-   - Simulation quality improvements
-   - Tunneling CCD
+| プロパティ | 型 | 説明 |
+|---|---|---|
+| `tokoya_alpha` | Float | 植毛半径 α cm（Plant Hair用） |
+| `tokoya_beta`  | Float | 植毛間隔 β cm（Plant Hair用） |
+| `tokoya_n`     | Float | 長さcm（Extend）または反復回数（Simulate） |
+| `tokoya_ref_obj` | String | 参照オブジェクト名（Empty or Mesh） |
+| `tokoya_spring_ke` など | Float/Int/Bool | 物理パラメーター（Simulate時に適用） |
 
-### Critical Taichi landmines (DO NOT violate)
+---
 
-1. **NO `from __future__ import annotations` in `_sim_taichi.py`**
-   → PEP 563 makes Taichi kernel type annotations into strings → compile fail
+## 6ボタンの動作仕様
 
-2. **`@ti.kernel` in `@ti.data_oriented` class: scalar args only**
-   → ndarray params break; use `field.from_numpy()` / `to_numpy()` instead
+### 1. Plant Hair
+- **入力**: Ref Obj (EMPTY) + α + β
+- **処理**: `_spiral_plant.plant_hair(empty_obj, alpha_cm, beta_cm)`
+- **前提**: シーンにCurvesオブジェクトが1個、`curves.surface = CC_Base_Body`、UV設定済み、CC_Base_Tongue02ボーン有り
+- **テスト実績**: α=27cm β=0.3cm、エンプティ（日本語名）で動作確認 ✅
 
-3. **Conditional variable in kernel**: use `ti.select(cond, a, b)`, not if/else
+### 2. Extend
+- **入力**: N cm
+- **処理**: `_mesh_ops.extend_length(obj, target_m=N/100)`
+- **動作**: 全ストランドをローカル座標でスケール（根元固定、先端をN cmに）
+- **用途**: ウニ → 大きなウニ（長さ統一）
 
-4. **No `ExportHelper`/`ImportHelper` in Blender 5.1 extensions**
-   → Use manual `context.window_manager.fileselect_add(self)` instead
+### 3. Simulate
+- **入力**: N（反復回数）
+- **処理**: `_snapshot_sim_params()` → `_world_passthrough.run_simulation(name, N, scene)`
+- **物理**: Taichi XPBD、CC_Base_Body 固定コリジョン（常にON）
+- **modifier補正**: eval_world - orig_world のオフセット補正あり（Katsura方式）
+- **ルート固定**: point[0]と point[1] がキネマティック（毛包アンカー）
 
-5. **Clean reinstall required after any module cache issue**
-   → `sys.modules` deletion + pyc deletion is not reliable; uninstall/reinstall is fastest
+### 4. Mesh Shrink
+- **入力**: Ref Obj (MESH)
+- **処理**: `_mesh_ops.mesh_shrink(obj, ref_mesh_obj)`
+- **アルゴリズム**:
+  1. evaluated world 座標を読む（Surface Deform modifier込み）
+  2. 全セグメントを走査して BVH 双方向レイキャスト
+  3. **全交差のうち最小弧長**を切断点とする（球体の2重交差対応）
+  4. scale = hit_arc / total_arc でローカル座標をスケール
+- **用途例**: Plane=高さカット、UV Sphere=丸くカット、半球=ボウルカット
+- **注意**: CURVE タイプ（楕円、円）は不可。UV Sphere を潰して使うこと
 
-6. **`SPRING_KD` is dead** — renamed to `DAMPING`. Backward-compat alias exists
-   in `_world_passthrough.py` (line ~38). Remove at v0.2.0.
+### 5. Mesh Extend
+- **入力**: Ref Obj (MESH)
+- **処理**: `_mesh_ops.mesh_extend(obj, ref_mesh_obj)`
+- **アルゴリズム**:
+  1. evaluated world 座標
+  2. 根元→先端方向に延長してレイキャスト（双方向）
+  3. 交差点が現在の先端より**遠い**場合のみ伸ばす（近い場合はShrinkの仕事）
+  4. scale = dist / rtt_len（直線距離比）
+- **用途**: メッシュ境界まで届いていないストランドを伸ばしてボリューム充填
 
-### MCP quick reference
+### 6. Urchin Reset
+- **入力**: なし
+- **処理**: `_mesh_ops.urchin_reset(obj)`
+- **動作**: 各ストランドを point[0]→point[1] 方向（毛包法線）に等間隔再配置。弧長保持。
+- **用途**: シミュレーションや等比収縮後の歪みリセット → 再シミュレーション
+
+---
+
+## 標準作業手順（ユーザー確立済み）
+
+```
+1. Plant Hair (α=27, β=0.3, Empty配置)
+   ↓
+2. Extend (N=30 → 30cmウニ)
+   ↓
+3. Simulate (N=20 → 自然な垂れ)
+   ↓
+4. Mesh Shrink (球or平面で高さカット/丸カット)
+   ↓
+5. Mesh Shrink (前髪ラインをPlaneで)  ← 複数回OK
+   ↓
+6. Urchin Reset (等比収縮の歪み除去)
+   ↓
+7. Simulate (N=20 → 最終仕上げ)
+   ↓
+8. Blender スカルプト (Hair Brush で細部)
+```
+
+---
+
+## 重要な地雷・注意事項
+
+### Taichi 地雷（_sim_taichi.py を触る場合）
+1. **`from __future__ import annotations` 禁止** → PEP 563 がカーネル型注釈を文字列化 → コンパイル失敗
+2. **`@ti.kernel` の引数はスカラーのみ** → ndarray は `field.from_numpy()` / `to_numpy()` 経由
+3. **カーネル内条件分岐**: `ti.select(cond, a, b)` を使う（if/else 不可）
+4. **キャッシュ問題**: pyc 削除では解決しない。必ずアンインストール→再インストール
+
+### Blender 5.1 地雷
+- **ExportHelper / ImportHelper 禁止** → `context.window_manager.fileselect_add(self)` を使う
+- **CURVE タイプは BVH 不可** → Plane/Sphere 等 MESH タイプのみ Shrink/Extend で使える
+- **`surface_uv_coordinate` 属性**: スカルプト Add ブラシで自動生成されるが、空の Curves オブジェクトには存在しない → `_spiral_plant.py` で自動作成済み
+
+### Mesh Shrink/Extend の座標系
+- **交差判定**: 必ず `evaluated_get(deps)` の world 座標を使う（Surface Deform modifier込み）
+- **書き戻し**: ローカル座標に scale-from-root で書く（スケールは無次元なので modifier 補正不要）
+
+---
+
+## バージョン履歴（Tokoya）
+
+| バージョン | コミット | 内容 |
+|---|---|---|
+| v0.1.1 | f81b435 | Katsura からリネーム fork |
+| v0.2.0 | 0966efd | 床屋アーキテクチャ完成（バッファ・ハンドラ削除、新ファイル追加） |
+| v0.2.1 | f80e608 | pick_ref オペレーター（スポイトボタン） |
+| v0.2.2 | cfefb86 | surface_uv_coordinate 欠損バグ修正 |
+| v0.2.3 | e59a4c0 | mesh_shrink/extend 座標系バグ修正（evaluated使用、双方向レイキャスト） |
+| v0.2.4 | 9d55c72 | CURVE タイプのエラーメッセージ改善 |
+| **v0.2.5** | **f6efff8** | **mesh_shrink: 閉じたメッシュの2重交差で最小弧長を選ぶ** |
+
+---
+
+## 未解決 / 次回持ち越し
+
+### 確定している次の作業
+- なし（ユーザーが「今日はここまで」と終了）
+
+### ユーザーが寝ながら考えること
+- 追加ボタンのアイデア（現状6ボタン、10個まで余裕あり）
+
+### 候補アイデア（未確定）
+- **長さ情報表示** — 平均・最大・最小長さを表示するボタン
+- **領域選択カット** — Empty 近傍だけ操作（部分カット）
+- **ランダム変化** — 長さに±X%のランダムゆらぎ
+- **旋毛位置のQuickSet** — 前回の Empty 座標を一発再現
+
+### 旋毛テストデータ（要確認）
+- α=27cm、β=0.3cm、Empty名=「エンプティ」
+- **Empty の正確な世界座標は未取得**（次回 MCP 接続時に読む）
+  ```python
+  import bpy
+  for o in bpy.data.objects:
+      if o.type == "EMPTY":
+          print(o.name, list(o.matrix_world.translation))
+  ```
+
+---
+
+## MCP クイックリファレンス（Tokoya 用）
 
 ```python
-# Check state
-import bpy; wm = bpy.context.window_manager
-wm.hair_sim_mode  # BYPASS / SIMULATING / PLAYBACK
+# 現状確認
+import bpy
+curves = [o for o in bpy.data.objects if o.type == "CURVES"]
+print(len(curves), "Curves objects")
 
-# Set param (display value, not physics!)
-wm.hair_sim_param_spring_ke = 4.0   # → 10,000 physics
-wm.hair_sim_param_damping   = 1.0   # → 0.01 physics
+# 植毛テスト（エンプティが選択されている状態で）
+import bpy
+wm = bpy.context.window_manager
+wm.tokoya_ref_obj = "エンプティ"
+wm.tokoya_alpha = 27.0
+wm.tokoya_beta = 0.3
+bpy.ops.tokoya.plant_hair()
 
-# Start sim
-bpy.ops.hair_sim.start()
-bpy.context.scene.frame_set(2)
+# Extend テスト
+wm.tokoya_n = 30.0
+bpy.ops.tokoya.extend()
+
+# Simulate テスト
+wm.tokoya_n = 20
+bpy.ops.tokoya.simulate()
 ```
-
-### Branch geography
-
-```
-* vbd-features-applied  d1603c6  Katsura v0.1.1 (current)
-  main                  7e7f63a  Phase 7W-G frozen
-  vbd-direction         d15f953  Newton VBD probe (abandoned)
-```
-
-No push to origin yet — user has not authorized.
 
 ---
 
-## Previous sessions (archived)
+## ブランチ地図
 
-See git log for full history. Key milestones:
-- v0.0.54 (6a7742e): Newton VBD, velocity-driven root — superseded
-- v0.0.57 (ab6bb07): First working Taichi XPBD + body collision
-- v0.0.60 (9fede78): Follicle anchor (point 1 kinematic)
-- v0.1.0 (2c38d01): Katsura panel, log-scale inputs, Save/Load
-- v0.1.1 (d1603c6): Label shortening — user-validated ✓
+```
+* vbd-features-applied  f6efff8  Tokoya v0.2.5 (現在)
+  main (Katsura)        7e7f63a  Phase 7W-G frozen — 触らない
+```
+
+origin への push はユーザー未承認。
 
 ---
 
-## What this project is
+## オーナー情報
 
-Blender 5.1 extension: hair (and future: cloth) physics simulation
-using Taichi XPBD on GPU. Target: Windows x64, RTX 5070 Ti.
-
-Owner: `azoo` / `ysk424`. Communication mostly Japanese.
-
-### Phase 1 invariants (still apply)
-
-- `frame_change_post` has exactly ONE handler from `bl_ext.user_default.hair_sim_physx`
-- `hair_sim_mode` WM property exists, defaults BYPASS, SKIP_SAVE
-- Start/Stop/Bypass operators are idempotent
+Owner: `azoo` / `ysk424` (ysk424@hotmail.com)  
+Communication: 主に日本語  
+Platform: Windows 11, RTX 5070 Ti, Blender 5.1
