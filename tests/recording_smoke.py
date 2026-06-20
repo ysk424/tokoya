@@ -49,9 +49,23 @@ wm = bpy.context.window_manager
 wm.tokoya_body_obj = body.name
 wm.tokoya_compute_backend = os.environ.get("TOKOYA_TEST_BACKEND", "CPU")
 wm.tokoya_frame_interpolation = 2
-wm.tokoya_substeps = 1
+assert wm.tokoya_substeps == 1
 wm.tokoya_iterations = 1
 wm.tokoya_simulation_steps = 1
+
+from tokoya_test import _recording
+
+spacing_roots = np.array(
+    [[0.0, 0.0, 0.0], [0.001768, 0.0, 0.0]], dtype=np.float32
+)
+spacing = _recording._median_root_spacing(spacing_roots)
+assert abs(spacing - 0.001768) < 1.0e-7, spacing
+target_roots = spacing_roots + np.array(
+    [0.005704, 0.0, 0.0], dtype=np.float32
+)
+assert _recording._auto_interpolation_count(
+    spacing_roots, target_roots, spacing
+) == 30
 
 # The existing single-frame styling path remains compatible.
 result = bpy.ops.tokoya.simulate()
@@ -63,10 +77,10 @@ assert wm.tokoya_record_mode == "RECORDING"
 assert scene.sync_mode == "NONE"
 
 scene.frame_set(2)
-from tokoya_test import _recording
 
 assert sorted(_recording.manager.frames) == [1, 2]
 assert np.isfinite(_recording.manager.frames[2][0]).all()
+assert wm.tokoya_auto_interpolation_current == 64
 
 # Reverse playback aborts recording and restores the cached frame.
 scene.frame_set(1)

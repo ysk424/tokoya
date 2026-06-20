@@ -61,7 +61,14 @@ class TOKOYA_PT_main(Panel):
         box = layout.box()
         box.label(text="Animation")
         col = box.column(align=True)
-        col.prop(wm, "tokoya_frame_interpolation")
+        col.prop(wm, "tokoya_auto_frame_interpolation")
+        row = col.row(align=True)
+        row.enabled = not wm.tokoya_auto_frame_interpolation
+        row.prop(wm, "tokoya_frame_interpolation")
+        if wm.tokoya_auto_frame_interpolation:
+            col.label(
+                text=f"Auto Steps: {wm.tokoya_auto_interpolation_current}"
+            )
         recording = getattr(wm, "tokoya_record_mode", "PLAYBACK") == "RECORDING"
         row = col.row(align=True)
         row.alert = recording

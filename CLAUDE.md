@@ -5,6 +5,30 @@ This file is a handoff log for Claude Code sessions.
 
 ---
 
+## Tokoya v0.4.8 (2026-06-21)
+
+- Auto Frame Interpolationが少し粗かったため、自動ステップ数を2倍化。
+- 旧Auto式の算出結果を2倍する。実質的な目標移動量は約12.5%。
+- Auto上限を32から64へ変更。静止時は引き続き1。
+- 実シーン422→423相当のAuto計算は15から30へ増加。
+
+---
+
+## Tokoya v0.4.7 (2026-06-21)
+
+- 録画中のWarp CUDA位置・速度をGPU上に保持し、Frame Interpolation間の
+  CPU→GPU再アップロードを廃止。位置は表示用、速度はフレーム確定時だけ取得。
+- `Auto Frame Interpolation`を追加し、既定ON。
+- REC開始時に毛根最近傍間隔の中央値を測定。各フレームの最大毛根移動から
+  `ceil(max_move * 1.1 / (median_spacing * 0.25))`を計算し、1～32へ制限。
+- 手動Frame InterpolationはAuto OFF時に使用。
+- Substeps既定値を8から1へ変更。機能とUIは維持。
+- 実シーン421～424で、頭頂部の422→423移動は平均5.091 mm、最大5.704 mm。
+  毛根間隔中央値1.768 mm。Auto計算は15となり、実測で安定した14に近い。
+- CPU/CUDA録画スモーク、Auto数式、Substeps既定値を検証。
+
+---
+
 ## ⚠️ START HERE — Tokoya v0.4.4 (2026-06-20)
 
 ### プロジェクト休止スナップショット

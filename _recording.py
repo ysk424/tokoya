@@ -7,12 +7,18 @@ from pathlib import Path
 import bpy
 import numpy as np
 from mathutils import Vector
+from mathutils.kdtree import KDTree
 
 from . import _world_passthrough as _wp
 
 
 POINTS_PER_STRAND = 9
 CACHE_SUFFIX = ".tokoya-cache.npz"
+AUTO_INTERPOLATION_MIN = 1
+AUTO_INTERPOLATION_MAX = 64
+AUTO_SPACING_FRACTION = 0.25
+AUTO_STEP_MULTIPLIER = 2
+AUTO_SAFETY_FACTOR = 1.1
 
 
 def _find_curves_obj():
@@ -30,6 +36,53 @@ def _cache_path() -> Path | None:
     return blend_path.with_name(blend_path.name + CACHE_SUFFIX)
 
 
+def _median_root_spacing(roots: np.ndarray) -> float:
+    """Return the median nearest-neighbour root spacing in world metres."""
+    count = len(roots)
+    if count < 2:
+        return 0.001
+    tree = KDTree(count)
+    for index, point in enumerate(roots):
+        tree.insert(tuple(point), index)
+    tree.balance()
+    distances = []
+    for point in roots:
+        nearest = tree.find_n(tuple(point), 2)
+        if len(nearest) > 1 and nearest[1][2] > 1.0e-8:
+            distances.append(float(nearest[1][2]))
+    if not distances:
+        return 0.001
+    return float(np.median(np.asarray(distances, dtype=np.float64)))
+
+
+def _auto_interpolation_count(
+    previous_roots: np.ndarray,
+    target_roots: np.ndarray,
+    median_spacing: float,
+) -> int:
+    """Choose twice the original motion-based interpolation count."""
+    if (
+        previous_roots.shape != target_roots.shape
+        or len(previous_roots) == 0
+        or median_spacing <= 1.0e-8
+    ):
+        return AUTO_INTERPOLATION_MIN
+    max_move = float(
+        np.linalg.norm(target_roots - previous_roots, axis=1).max()
+    )
+    if max_move <= 1.0e-8:
+        return AUTO_INTERPOLATION_MIN
+    target_step = median_spacing * AUTO_SPACING_FRACTION
+    base_count = int(
+        np.ceil(max_move * AUTO_SAFETY_FACTOR / target_step)
+    )
+    count = base_count * AUTO_STEP_MULTIPLIER
+    return max(
+        AUTO_INTERPOLATION_MIN,
+        min(AUTO_INTERPOLATION_MAX, count),
+    )
+
+
 class RecordingManager:
     def __init__(self):
         self.frames: dict[int, tuple[np.ndarray, np.ndarray]] = {}
@@ -41,6 +94,8 @@ class RecordingManager:
         self.solver = None
         self.root_indices: np.ndarray | None = None
         self.root_mask: np.ndarray | None = None
+        self.previous_roots: np.ndarray | None = None
+        self.median_root_spacing = 0.001
         self._inside_frame_eval = False
         self.dirty = False
         self.previous_sync_mode: str | None = None
@@ -143,6 +198,12 @@ class RecordingManager:
         self.solver = solver
         self.root_indices = roots
         self.root_mask = root_mask
+        self.previous_roots = eval_world[roots].copy()
+        self.median_root_spacing = _median_root_spacing(
+            self.previous_roots
+        )
+        wm = bpy.context.window_manager
+        wm.tokoya_auto_interpolation_current = 1
         self.frames[frame] = (positions.copy(), velocities.copy())
         self.dirty = True
         self.previous_sync_mode = scene.sync_mode
@@ -150,7 +211,8 @@ class RecordingManager:
         self._set_mode("RECORDING")
         print(
             f"[tokoya/record] recording from frame {frame}; "
-            f"sync {self.previous_sync_mode} -> NONE"
+            f"sync {self.previous_sync_mode} -> NONE; "
+            f"median root spacing={self.median_root_spacing:.6g} m"
         )
         return True, f"Recording from frame {frame}"
 
@@ -166,6 +228,7 @@ class RecordingManager:
         self.last_frame = None
         self.positions = None
         self.velocities = None
+        self.previous_roots = None
 
     def toggle(self, scene) -> tuple[bool, str]:
         if self.is_recording():
@@ -289,7 +352,27 @@ class RecordingManager:
         if obj is None or obj.type != "CURVES":
             return False
         wm = bpy.context.window_manager
-        interpolation = max(1, int(wm.tokoya_frame_interpolation))
+        current_eval = obj.evaluated_get(
+            bpy.context.evaluated_depsgraph_get()
+        )
+        current_world = _wp._read_world(
+            current_eval.data, self.n_total, current_eval.matrix_world
+        )
+        if current_world is None:
+            return False
+        target_roots = current_world[self.root_indices].copy()
+        if (
+            wm.tokoya_auto_frame_interpolation
+            and self.previous_roots is not None
+        ):
+            interpolation = _auto_interpolation_count(
+                self.previous_roots,
+                target_roots,
+                self.median_root_spacing,
+            )
+        else:
+            interpolation = max(1, int(wm.tokoya_frame_interpolation))
+        wm.tokoya_auto_interpolation_current = interpolation
         fps = float(scene.render.fps) / float(scene.render.fps_base)
         if fps <= 0.0:
             return False
@@ -298,6 +381,9 @@ class RecordingManager:
 
         from . import _sim_taichi
 
+        keeps_state_on_device = bool(
+            getattr(self.solver, "keeps_state_on_device", False)
+        )
         for index in range(1, interpolation + 1):
             if index == interpolation:
                 self._evaluate_subframe(scene, target_frame, 0.0)
@@ -344,9 +430,13 @@ class RecordingManager:
                 )
                 collision = self._make_collision_callback(body_bvh)
 
-            self.solver.set_positions_velocities(
-                self.positions, self.velocities
-            )
+            # Warp CUDA retains the authoritative position and velocity state
+            # between interpolation steps. Re-upload only for solvers whose
+            # state may have been modified on the host.
+            if not keeps_state_on_device:
+                self.solver.set_positions_velocities(
+                    self.positions, self.velocities
+                )
             self.positions = self.solver.run_frame(
                 dt=dt_subframe,
                 n_substeps=_wp.SUBSTEPS,
@@ -362,10 +452,17 @@ class RecordingManager:
                 body_collision_fn=collision,
                 post_collision_iterations=_wp.POST_COLLISION_ITERATIONS,
             )
-            self.velocities = self.solver.get_velocities_numpy()
+            if not keeps_state_on_device:
+                self.velocities = self.solver.get_velocities_numpy()
             _wp._write_world(obj, self.positions, offset=offset_world)
 
+        if keeps_state_on_device:
+            # Velocity is needed on the host only for the completed-frame
+            # recording cache. Intermediate interpolation steps stay on GPU.
+            self.velocities = self.solver.get_velocities_numpy()
+
         self.last_frame = target_frame
+        self.previous_roots = target_roots
         self.frames[target_frame] = (
             self.positions.copy(),
             self.velocities.copy(),

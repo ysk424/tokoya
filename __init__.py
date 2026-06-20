@@ -333,6 +333,16 @@ def register():
                 "fast Body motion causes tunneling"
             ),
             default=2, min=1, max=64, options={"SKIP_SAVE"})
+        WindowManager.tokoya_auto_frame_interpolation = BoolProperty(
+            name="Auto Frame Interpolation",
+            description=(
+                "Choose 1-64 interpolation steps from root motion and "
+                "median root spacing"
+            ),
+            default=True, options={"SKIP_SAVE"})
+        WindowManager.tokoya_auto_interpolation_current = IntProperty(
+            name="Auto Steps", default=1, min=1, max=64,
+            options={"SKIP_SAVE"})
         WindowManager.tokoya_record_mode = EnumProperty(
             name="Recording Mode",
             items=(
@@ -406,6 +416,8 @@ def register():
         for name in (
             "tokoya_strand_count", "tokoya_max_length_cm",
             "tokoya_simulation_steps", "tokoya_frame_interpolation",
+            "tokoya_auto_frame_interpolation",
+            "tokoya_auto_interpolation_current",
             "tokoya_record_mode", "tokoya_compute_backend",
             "tokoya_body_obj", "tokoya_cutter_obj",
             "tokoya_spring_ke", "tokoya_damping", "tokoya_particle_mass",
@@ -433,6 +445,8 @@ def unregister():
     for name in (
         "tokoya_strand_count", "tokoya_max_length_cm",
         "tokoya_simulation_steps", "tokoya_frame_interpolation",
+        "tokoya_auto_frame_interpolation",
+        "tokoya_auto_interpolation_current",
         "tokoya_record_mode", "tokoya_compute_backend",
         "tokoya_body_obj", "tokoya_cutter_obj",
         "tokoya_spring_ke", "tokoya_damping", "tokoya_particle_mass",

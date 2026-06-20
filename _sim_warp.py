@@ -116,6 +116,7 @@ class WarpXPBDSolver:
     """XPBD solver that keeps simulation and collision state on one GPU."""
 
     uses_warp_device_collision = True
+    keeps_state_on_device = True
 
     def __init__(
         self,
