@@ -5,7 +5,78 @@ This file is a handoff log for Claude Code sessions.
 
 ---
 
-## ⚠️ START HERE — Tokoya v0.4.3 (2026-06-20)
+## ⚠️ START HERE — Tokoya v0.4.4 (2026-06-20)
+
+### v0.4.4 Warp GPU共有化
+
+- CUDA時のXPBD物理をWarpへ移し、Body衝突と同じGPU配列を直接共有する。
+- サブステップ内のTaichi→NumPy→Warp→NumPy→Taichi往復を除去。
+- 36,000点の物理＋衝突ベンチは0.148秒→0.054秒、約2.75倍。
+- ユーザー本番実測は1分80フレーム→120フレーム。
+- 初期設定をBending OFF、Stiffness 9.0、Damping 8.0、Mass 100へ変更。
+- CUDA/CPU録画、登録ロールバック、Bending ON/OFF数値比較を通過。
+- 配布ZIP: `dist/tokoya-0.4.4.zip`
+- SHA256:
+  `BF02757A0206AAD75AC7D2EED5AA94676A226FD474315C28AB28C4A03EF0619E`
+
+### 電源断・次回セッション再開用スナップショット
+
+- 最新コミット: `0fb1fe2 Tokoya v0.4.3: accelerate body collision with Warp CUDA`
+- `origin/main`へpush済み。ローカル作業ツリーはpush直後クリーン。
+- 配布ZIP: `dist/tokoya-0.4.3.zip`
+- SHA256:
+  `2CF0F436F6C5EAB54ECE42F8CE4C919D8934A67B785A3E666409FC6150B2582B`
+- 本番Blend:
+  `C:\Users\azoo\Documents\Blender\QueSera2\YOKO3-3-4test.blend`
+- 本番録画キャッシュ:
+  `YOKO3-3-4test.blend.tokoya-cache.npz`
+- MCP監査時のHair:
+  `Curves`、4,000本、9点/本、合計36,000点。
+- Body: `CC_Base_Body`。評価後メッシュは約225,184頂点、
+  449,472三角形（Blender loop triangle化後）。
+- 本番設定:
+  CUDA、Frame Interpolation=2、Physics Substeps=8、Iterations=20、
+  FPS=24、FPS Base=1。
+- ユーザー実測:
+  80フレームを約1分。Frame Interpolation=2なので小数フレーム物理計算は
+  合計160回。約0.375秒/小数フレーム。
+- 開発計測:
+  旧v0.4.2は1フレーム19.85秒、うちPython BVH衝突19.00秒（95.7%）。
+  v0.4.3定常値は1フレーム0.687秒、旧版比28.9倍。
+- 4,000本の静的`Simulate`は1ステップ0.858秒。
+- 全32,000ストランドセグメントの最終Body交差監査は0。
+- v0.4.3の実装:
+  `_collision_warp.py`でNVIDIA Warp 1.13.0のCUDA Mesh BVHを使用。
+  点スイープCCD、近傍投影、セグメントレイ、内向き法線速度除去をGPU化。
+- NVIDIA WarpはBlender 5.1に同梱されており、RTX 5070 Ti
+  （16 GiB、sm_120）を正常認識。追加PyTorchインストールは不要。
+- CUDAでWarpが失敗した場合、またはVulkan/CPUでは旧Python Blender BVHへ
+  自動フォールバックする。
+- 初回だけWarpカーネルコンパイルに約1秒。以後はWarpキャッシュを使用。
+- v0.4.2で実装したREC仕様:
+  REC→Timeline Play、順方向+1のみ録画、逆再生/ジャンプでPLAYBACKへ停止、
+  再録画開始フレーム以降を上書き、位置+速度をNPZ保存。
+- REC中は`scene.sync_mode = "NONE"`（Play Every Frame）へ自動変更し、
+  停止時に元設定へ戻す。`Sync to Audio`のままだと計算中にフレームが飛び、
+  録画がジャンプ判定で停止していた。
+- Blender拡張登録時の`_RedirectData.filepath`問題はv0.4.1で修正済み。
+  登録途中の例外はOperator/Panel/Property/handlerをロールバックする。
+- テスト:
+  `tests/recording_smoke.py`はCUDA/CPU、静的Simulate、REC、逆再生停止、
+  再録画、NPZ保存・読込を検証。
+  `tests/registration_rollback.py`は登録失敗後の再登録を検証。
+  `tests/warp_collision_benchmark.py`はWarp Mesh近傍照会ベンチ。
+- 注意:
+  MCP上でワークスペース版を一時ロードして1062/1063をベンチしたが、
+  本番インストール済みv0.4.2側の録画キャッシュは1061まで保存済み。
+  ベンチ後、表示Hairは録画済み1061フレームへ復元した。
+- 次回開始:
+  1. Blender再起動。
+  2. `dist/tokoya-0.4.3.zip`をインストール。
+  3. 本番Blendを開き、Frame 1061付近からRECを再開。
+  4. 見た目、Body貫通、録画キャッシュ保存を本番尺で確認。
+- 現時点の次課題は、v0.4.3を本番アニメーション全体で視覚評価すること。
+  速度目標「10倍」は達成済み。次は品質・安定性を優先する。
 
 ### v0.4.3 Warp CUDA衝突高速化
 

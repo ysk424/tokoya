@@ -141,6 +141,16 @@ def run_simulation(curves_obj_name: str, n_steps: int,
                 search_distance=COLLISION_SEARCH,
             )
             print('[tokoya/sim] NVIDIA Warp CUDA collision enabled')
+            from ._sim_warp import WarpXPBDSolver
+            solver = WarpXPBDSolver(
+                n_total=n_total,
+                n_strands=n_strands,
+                pps=POINTS_PER_STRAND,
+                init_pos=curr_world,
+                particle_mass=PARTICLE_MASS,
+                bending_enabled=BENDING_ENABLED,
+            )
+            print('[tokoya/sim] Warp CUDA shared-state solver enabled')
         except Exception as exc:
             print(
                 '[tokoya/sim] Warp collision unavailable; '

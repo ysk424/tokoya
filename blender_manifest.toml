@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "tokoya"
-version = "0.4.3"
+version = "0.4.4"
 name = "Tokoya"
 tagline = "Tokoya (床屋, barber) — Taichi XPBD hair styling"
 maintainer = "Yoshihiko Tsukamoto <ysk424@hotmail.com>"
@@ -22,6 +22,7 @@ paths = [
     "_world_passthrough.py",
     "_recording.py",
     "_collision_warp.py",
+    "_sim_warp.py",
     "_sim_taichi.py",
     "_mask_plant.py",
     "_mesh_ops.py",

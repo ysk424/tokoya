@@ -102,11 +102,8 @@ class RecordingManager:
         n_strands = n_total // POINTS_PER_STRAND
         roots = np.arange(n_strands, dtype=np.int32) * POINTS_PER_STRAND
         try:
-            from . import _sim_taichi
-            solver_cls = _sim_taichi.get_solver_class(
-                bpy.context.window_manager.tokoya_compute_backend
-            )
-            solver = solver_cls(
+            backend = bpy.context.window_manager.tokoya_compute_backend
+            solver_kwargs = dict(
                 n_total=n_total,
                 n_strands=n_strands,
                 pps=POINTS_PER_STRAND,
@@ -114,9 +111,25 @@ class RecordingManager:
                 particle_mass=_wp.PARTICLE_MASS,
                 bending_enabled=_wp.BENDING_ENABLED,
             )
+            if backend == "CUDA":
+                try:
+                    from ._sim_warp import WarpXPBDSolver
+                    solver = WarpXPBDSolver(**solver_kwargs)
+                except Exception as exc:
+                    print(
+                        "[tokoya/record] Warp solver unavailable; "
+                        f"using Taichi CUDA: {exc!r}"
+                    )
+                    from . import _sim_taichi
+                    solver_cls = _sim_taichi.get_solver_class(backend)
+                    solver = solver_cls(**solver_kwargs)
+            else:
+                from . import _sim_taichi
+                solver_cls = _sim_taichi.get_solver_class(backend)
+                solver = solver_cls(**solver_kwargs)
             solver.set_positions_velocities(positions, velocities)
         except Exception as exc:
-            return False, f"Taichi solver build failed: {exc!r}"
+            return False, f"Physics solver build failed: {exc!r}"
 
         root_mask = np.zeros(n_total, dtype=bool)
         root_mask[roots] = True

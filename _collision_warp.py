@@ -219,14 +219,34 @@ class WarpBodyCollider:
         self.velocities.assign(
             np.ascontiguousarray(vel_np, dtype=np.float32)
         )
+        self.apply_device(
+            self.positions,
+            self.predicted,
+            self.velocities,
+            allow_sweep=allow_sweep,
+            final_cleanup=final_cleanup,
+        )
+        wp.synchronize()
+        pred_np[:] = self.predicted.numpy()
+        vel_np[:] = self.velocities.numpy()
+
+    def apply_device(
+        self,
+        positions,
+        predicted,
+        velocities,
+        allow_sweep=True,
+        final_cleanup=False,
+    ):
+        """Run collision in-place on Warp CUDA arrays without host copies."""
         wp.launch(
             _point_collision,
             dim=self.n_total,
             inputs=[
                 self.mesh.id,
-                self.positions,
-                self.predicted,
-                self.velocities,
+                positions,
+                predicted,
+                velocities,
                 self.points_per_strand,
                 self.margin,
                 self.search_distance,
@@ -242,8 +262,8 @@ class WarpBodyCollider:
                     dim=self.n_segments,
                     inputs=[
                         self.mesh.id,
-                        self.predicted,
-                        self.velocities,
+                        predicted,
+                        velocities,
                         self.points_per_strand,
                         self.margin,
                         parity,
@@ -251,6 +271,3 @@ class WarpBodyCollider:
                     ],
                     device=self.device,
                 )
-        wp.synchronize()
-        pred_np[:] = self.predicted.numpy()
-        vel_np[:] = self.velocities.numpy()
