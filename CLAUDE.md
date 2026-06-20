@@ -15,6 +15,10 @@ This file is a handoff log for Claude Code sessions.
 - Autoまたは手動Frame InterpolationへInterpolation Magを乗算する。
 - v0.4.8の固定2倍を廃止。Auto基礎値はv0.4.7相当へ戻す。
 - Iterations既定値を20から10へ変更。
+- REC用物理パラメーターはREC ON時に`_snapshot_sim_params()`で読み込む。
+  Gravityなどを区間途中で変える場合はREC OFF→設定変更→REC ONで反映する。
+  斜め後方へ引く区間と、下へ垂らす区間を分ける運用が可能。
+- Interpolation Magは録画中も各フレームでWM値を読むため、次フレームから反映。
 
 ---
 
