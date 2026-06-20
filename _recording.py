@@ -306,10 +306,30 @@ class RecordingManager:
             offset_world = eval_world - orig_world
             roots = eval_world[self.root_indices]
             point1s = eval_world[self.root_indices + 1]
-            body_bvh = _sim_taichi.build_body_bvh(
-                wm.tokoya_body_obj.strip()
-            )
-            collision = self._make_collision_callback(body_bvh)
+            if wm.tokoya_compute_backend == "CUDA":
+                try:
+                    from ._collision_warp import WarpBodyCollider
+                    collision = WarpBodyCollider(
+                        body_name=wm.tokoya_body_obj.strip(),
+                        n_total=self.n_total,
+                        points_per_strand=POINTS_PER_STRAND,
+                        margin=_wp.COLLISION_MARGIN,
+                        search_distance=_wp.COLLISION_SEARCH,
+                    )
+                except Exception as exc:
+                    print(
+                        "[tokoya/record] Warp collision unavailable; "
+                        f"using Python BVH: {exc!r}"
+                    )
+                    body_bvh = _sim_taichi.build_body_bvh(
+                        wm.tokoya_body_obj.strip()
+                    )
+                    collision = self._make_collision_callback(body_bvh)
+            else:
+                body_bvh = _sim_taichi.build_body_bvh(
+                    wm.tokoya_body_obj.strip()
+                )
+                collision = self._make_collision_callback(body_bvh)
 
             self.solver.set_positions_velocities(
                 self.positions, self.velocities

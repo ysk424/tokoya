@@ -8,6 +8,7 @@ Tokoya（床屋、英語では *barber*）は、Blender 5.1用のヘアースタ
 - 4,000本を既定値とする面積一様な植毛
 - 根元が密で毛先ほど疎い、9点・8関節のストランド
 - CUDA（既定）、Vulkan、CPUバックエンド
+- NVIDIA WarpによるCUDA Body衝突のバッチ処理
 - 小数フレーム補間を使ったCUDAアニメーション録画と再生
 - Blenderプロジェクトと同じ場所へ保存される圧縮キャッシュ
 - ワールド座標BVH、点の連続衝突判定、セグメント衝突拘束
@@ -21,9 +22,15 @@ Tokoya（床屋、英語では *barber*）は、Blender 5.1用のヘアースタ
 - Blender 5.1以降
 - Windows x64
 - Pythonパッケージ `taichi`
+- NVIDIA Warp（Blender 5.1同梱版を使用）
 - CUDA利用時は対応するNVIDIA GPUとドライバー
 
 TaichiはBlenderが使用するPython 3.13環境から参照できるユーザーsite-packagesへインストールしてください。
+
+CUDA選択時は、点CCD・近傍投影・全ストランド区間のBody衝突をNVIDIA
+WarpでGPUバッチ処理します。Warpを利用できない場合、またはVulkan/CPU選択時は
+従来のBlender BVH処理へ自動的にフォールバックします。初回実行時のみWarp
+カーネルのコンパイル時間が発生します。
 
 ## インストール
 

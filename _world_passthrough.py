@@ -128,9 +128,31 @@ def run_simulation(curves_obj_name: str, n_steps: int,
     root_mask[root_indices + 1] = True
 
     from . import _sim_taichi as _st
-    body_bvh = _st.build_body_bvh(BODY_COLLISION_TARGET)
-    if body_bvh is None:
-        print(f'[tokoya/sim] WARNING: BVH build failed for {BODY_COLLISION_TARGET!r}')
+    body_bvh = None
+    warp_collision = None
+    if COMPUTE_BACKEND == 'CUDA':
+        try:
+            from ._collision_warp import WarpBodyCollider
+            warp_collision = WarpBodyCollider(
+                body_name=BODY_COLLISION_TARGET,
+                n_total=n_total,
+                points_per_strand=POINTS_PER_STRAND,
+                margin=COLLISION_MARGIN,
+                search_distance=COLLISION_SEARCH,
+            )
+            print('[tokoya/sim] NVIDIA Warp CUDA collision enabled')
+        except Exception as exc:
+            print(
+                '[tokoya/sim] Warp collision unavailable; '
+                f'using Python BVH: {exc!r}'
+            )
+    if warp_collision is None:
+        body_bvh = _st.build_body_bvh(BODY_COLLISION_TARGET)
+        if body_bvh is None:
+            print(
+                f'[tokoya/sim] WARNING: BVH build failed for '
+                f'{BODY_COLLISION_TARGET!r}'
+            )
 
     from mathutils import Vector
 
@@ -251,6 +273,8 @@ def run_simulation(curves_obj_name: str, n_steps: int,
                 vel_np[i] -= normal * normal_speed
                 collision_stats["velocity"] += 1
 
+    collision_fn = warp_collision if warp_collision is not None else _body_fn
+
     print(f'[tokoya/sim] {n_steps} steps, {n_strands} strands, '
           f'ke={SPRING_KE:.4g}, damping={DAMPING:.4g}')
 
@@ -268,7 +292,7 @@ def run_simulation(curves_obj_name: str, n_steps: int,
             bend_ke           = BENDING_KE,
             damping           = DAMPING,
             bending_enabled   = BENDING_ENABLED,
-            body_collision_fn = _body_fn,
+            body_collision_fn = collision_fn,
             post_collision_iterations = POST_COLLISION_ITERATIONS,
         )
         curr_vel   = solver.get_velocities_numpy()
@@ -282,7 +306,7 @@ def run_simulation(curves_obj_name: str, n_steps: int,
     # feeding the displacement back into velocity.
     for _ in range(8):
         before = collision_stats["segment"]
-        _body_fn(
+        collision_fn(
             curr_world, curr_world, curr_vel,
             allow_sweep=False, final_cleanup=True,
         )
