@@ -3,6 +3,21 @@
 This file is a handoff log for Claude Code sessions.
 **Read this first** before touching anything in this repo.
 
+## v0.6.1 final Simulate length fix (2026-06-29)
+
+Root cause of the "hair gets longer after Simulate": the final safety audit in
+`_world_passthrough.run_simulation()` resolved residual segment/body crossings by
+snapping individual downstream points to the Body surface, then wrote the result
+back without another length reconciliation. That collision-only direct correction
+can increase strand arc length even though the XPBD spring solve itself uses rest
+segment lengths.
+
+Fix: capture per-segment lengths from the pre-sim world positions, and after each
+final cleanup pass rebuild each strand from root to tip using the current
+directions but the original segment lengths. Points 0 and 1 remain follicle
+anchors. Protected/frozen strands are skipped. This keeps the final Body cleanup
+from becoming an accidental hair-length edit.
+
 ---
 
 ## Tokoya v0.5.0 (2026-06-21)

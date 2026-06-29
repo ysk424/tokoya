@@ -11,6 +11,8 @@ Tokoya（床屋、英語では *barber*）は、Blender 5.1用のヘアースタ
 - CUDA（既定）、Vulkan、CPUバックエンド
 - NVIDIA WarpによるCUDA Body衝突のバッチ処理
 - ワールド座標BVH、点の連続衝突判定、セグメント衝突拘束
+- v0.6.1: `Simulate` の最終衝突クリーンアップ後に開始時のセグメント長へ
+  再拘束し、Body表面への直接補正で毛が伸びる問題を抑制
 - `Mesh Shrink`による平面・球などを使ったカット
 - `Urchin Reset`による直毛状態への復帰
 

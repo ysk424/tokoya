@@ -67,6 +67,56 @@ def _write_world(obj, world_pts: np.ndarray,
     obj.data.update_tag()
 
 
+def _segment_lengths(world_pts: np.ndarray, points_per_strand: int) -> np.ndarray:
+    n_strands = len(world_pts) // points_per_strand
+    lengths = np.empty((n_strands, points_per_strand - 1), dtype=np.float32)
+    for strand in range(n_strands):
+        base = strand * points_per_strand
+        delta = world_pts[base + 1:base + points_per_strand] - world_pts[
+            base:base + points_per_strand - 1
+        ]
+        lengths[strand] = np.maximum(np.linalg.norm(delta, axis=1), 1.0e-6)
+    return lengths
+
+
+def _restore_segment_lengths(
+    world_pts: np.ndarray,
+    rest_lengths: np.ndarray,
+    points_per_strand: int,
+    frozen_mask: 'np.ndarray | None' = None,
+) -> np.ndarray:
+    """Clamp final collision cleanup back to the pre-sim strand lengths.
+
+    The final segment-crossing cleanup may move individual points directly to
+    the collider surface. That is useful for removing tiny residual crossings,
+    but if left unreconciled it can make the visible hair longer. Rebuild each
+    strand from root to tip using the current directions and the original
+    per-segment lengths, keeping the two follicle points fixed.
+    """
+    out = world_pts.copy()
+    n_strands = len(world_pts) // points_per_strand
+    for strand in range(n_strands):
+        base = strand * points_per_strand
+        if frozen_mask is not None and bool(frozen_mask[base]):
+            continue
+        for segment in range(1, points_per_strand - 1):
+            prev_i = base + segment
+            curr_i = prev_i + 1
+            direction = out[curr_i] - out[prev_i]
+            length = float(np.linalg.norm(direction))
+            if length <= 1.0e-9:
+                direction = world_pts[curr_i] - world_pts[curr_i - 1]
+                length = float(np.linalg.norm(direction))
+            if length <= 1.0e-9:
+                continue
+            out[curr_i] = (
+                out[prev_i]
+                + direction.astype(np.float32) / length
+                * rest_lengths[strand, segment]
+            )
+    return out
+
+
 def run_simulation(curves_obj_name: str, n_steps: int,
                    scene, protected_indices=None) -> str:
     obj = bpy.data.objects.get(curves_obj_name)
@@ -101,6 +151,7 @@ def run_simulation(curves_obj_name: str, n_steps: int,
     offset_w = eval_w - orig_w
 
     curr_world = eval_w.copy()
+    rest_lengths = _segment_lengths(curr_world, points_per_strand)
     curr_vel   = np.zeros_like(curr_world)
 
     # Build frozen mask for protected strands (all points of those strands stay fixed)
@@ -324,6 +375,9 @@ def run_simulation(curves_obj_name: str, n_steps: int,
         collision_fn(
             curr_world, curr_world, curr_vel,
             allow_sweep=False, final_cleanup=True,
+        )
+        curr_world = _restore_segment_lengths(
+            curr_world, rest_lengths, points_per_strand, prot_mask
         )
         if collision_stats["segment"] == before:
             break
