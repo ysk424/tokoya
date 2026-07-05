@@ -1,9 +1,9 @@
 schema_version = "1.0.0"
 
 id = "tokoya"
-version = "0.6.1"
+version = "0.6.2"
 name = "Tokoya"
-tagline = "Tokoya (床屋, barber) — Taichi XPBD hair styling"
+tagline = "Tokoya (床屋, barber) — mask planting and long-hair grooming"
 maintainer = "Yoshihiko Tsukamoto <ysk424@hotmail.com>"
 type = "add-on"
 
@@ -25,6 +25,8 @@ paths = [
     "_sim_taichi.py",
     "_mask_plant.py",
     "_mesh_ops.py",
+    "_initial_groom.py",
+    "_collider_proxy.py",
     "tokoya_defaults.json",
     "README.md",
     "LICENSE",

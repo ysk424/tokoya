@@ -37,50 +37,45 @@ class TOKOYA_PT_main(Panel):
         col.prop(wm, "tokoya_strand_count")
         col.prop(wm, "tokoya_max_length_cm")
 
-        # Persistent body and temporary cutter targets
+        # Persistent hair/body/clothes targets and temporary cutter target
         box = layout.box()
-        box.label(text="Meshes")
+        box.label(text="Objects")
         col = box.column(align=True)
+        row = col.row(align=True)
+        row.prop(wm, "tokoya_hair_obj", text="Hair")
+        row.operator("tokoya.pick_hair", text="", icon="EYEDROPPER")
         row = col.row(align=True)
         row.prop(wm, "tokoya_body_obj", text="Body")
         row.operator("tokoya.pick_body", text="", icon="EYEDROPPER")
         row = col.row(align=True)
+        row.prop(wm, "tokoya_clothes_obj", text="Clothes")
+        row.operator("tokoya.pick_clothes", text="", icon="EYEDROPPER")
+        row = col.row(align=True)
         row.prop(wm, "tokoya_cutter_obj", text="Cutter")
         row.operator("tokoya.pick_cutter", text="", icon="EYEDROPPER")
-        col.prop(wm, "tokoya_simulation_steps")
-        col.prop(wm, "tokoya_compute_backend")
 
         layout.separator(factor=0.3)
 
         # Main buttons
         col = layout.column(align=True)
         col.operator("tokoya.plant_hair",  icon="OUTLINER_OB_CURVES")
-        col.operator("tokoya.simulate",     icon="PLAY")
+        col.operator("tokoya.simulate",     icon="MOD_CLOTH")
 
         box = layout.box()
-        box.label(text="Animation")
+        box.label(text="Settle Hair Back")
+        col = box.column(align=True)
+        col.prop(wm, "tokoya_groom_radius_mm")
+        col.prop(wm, "tokoya_groom_follow_mm")
+        col.prop(wm, "tokoya_groom_release_mm")
 
-        col = layout.column(align=True)
+        box = layout.box()
+        box.label(text="Cut / Reset")
+
+        col = box.column(align=True)
         col.separator()
         col.operator("tokoya.mesh_shrink",  icon="MOD_SOLIDIFY")
         col.separator()
         col.operator("tokoya.urchin_reset", icon="FORCE_FORCE")
-
-        # Physics params
-        layout.separator(factor=0.3)
-        box = layout.box()
-        box.label(text="Physics (applied at Simulate)")
-        col = box.column(align=True)
-        col.prop(wm, "tokoya_spring_ke")
-        col.prop(wm, "tokoya_damping")
-        col.prop(wm, "tokoya_particle_mass")
-        col.prop(wm, "tokoya_gravity")
-        col.separator()
-        col.prop(wm, "tokoya_iterations")
-        col.prop(wm, "tokoya_bending_enabled")
-        if getattr(wm, "tokoya_bending_enabled", False):
-            col.prop(wm, "tokoya_root_bending_ke")
-            col.prop(wm, "tokoya_bending_ke")
 
 
 _classes = (TOKOYA_PT_main,)

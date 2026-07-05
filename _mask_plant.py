@@ -262,6 +262,7 @@ def plant_mask_hair(
     strand_count: int,
     max_length_cm: float,
     seed: int = 20260620,
+    curves_obj: bpy.types.Object | None = None,
 ) -> dict:
     """Fill the non-white mask region with fixed-count, variable-length hair.
 
@@ -276,7 +277,9 @@ def plant_mask_hair(
     if max_length_cm <= 0.0:
         raise ValueError("Maximum length must be positive")
 
-    curves_obj = _find_single_curves()
+    curves_obj = curves_obj if curves_obj is not None else _find_single_curves()
+    if curves_obj.type != "CURVES":
+        raise RuntimeError("Hair object must be Curves")
     _prepare_empty_curves(curves_obj)
     _apply_mesh_scale(mask_obj)
 

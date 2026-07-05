@@ -3,6 +3,35 @@
 This file is a handoff log for Claude Code sessions.
 **Read this first** before touching anything in this repo.
 
+## v0.6.2 Yurameki Settle migration (2026-07-05)
+
+Long straight hair setup is now split by responsibility:
+
+- Tokoya owns planting, cutting, reset, and initial grooming.
+- Yurameki owns time simulation only.
+
+Reason: Yurameki's `Settle Hair Back` was not a real simulation step. It was a
+CPU BVH initial groom that preserved the top-of-head curve while laying long
+straight hair behind the body and downward. Keeping that operation in Yurameki
+mixed grooming with simulation and made the solver direction harder to reason
+about. Moving it to Tokoya keeps the beautiful initial shape as a grooming
+asset, then Yurameki can simulate that already-settled state.
+
+Implementation:
+
+- The old `tokoya.simulate` button label and behavior were replaced with
+  `Settle Hair Back`.
+- Yurameki's `initial_groom.py` and `collider_proxy.py` were copied exactly as
+  `_initial_groom.py` and `_collider_proxy.py`; hashes matched the Yurameki
+  source at migration time.
+- Hair, Body, Clothes, and Cutter pickers were added. Plant, Settle, Shrink,
+  and Urchin Reset now use the selected Hair Curves object.
+- When Settle runs, Tokoya reuses a valid filled Body proxy if one exists. If
+  none exists, it builds one automatically before grooming.
+- The user verified the migrated Settle path works in Blender.
+
+---
+
 ## v0.6.1 final Simulate length fix (2026-06-29)
 
 Root cause of the "hair gets longer after Simulate": the final safety audit in

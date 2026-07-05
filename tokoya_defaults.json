@@ -8,5 +8,8 @@
     "BENDING_ENABLED":       false,
     "ROOT_BENDING_KE":       2000.0,
     "BENDING_KE":            10.0,
-    "BODY_COLLISION_TARGET": "CC_Base_Body"
+    "BODY_COLLISION_TARGET": "CC_Base_Body",
+    "GROOM_RADIUS_MM":       2.5,
+    "GROOM_FOLLOW_MM":       30.0,
+    "GROOM_RELEASE_MM":      20.0
 }
