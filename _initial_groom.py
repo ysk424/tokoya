@@ -155,14 +155,33 @@ def settle_hair_back(
         raise ValueError("Curves object has no strands")
 
     n_total = len(attr.data)
-    flat = [0.0] * (n_total * 3)
-    attr.data.foreach_get("vector", flat)
+    raw_flat = [0.0] * (n_total * 3)
+    attr.data.foreach_get("vector", raw_flat)
     world_m = curves_obj.matrix_world
     world_inv = curves_obj.matrix_world.inverted()
-    world_pts = [
-        world_m @ Vector((flat[i * 3], flat[i * 3 + 1], flat[i * 3 + 2]))
+    raw_world_pts = [
+        world_m @ Vector((raw_flat[i * 3], raw_flat[i * 3 + 1], raw_flat[i * 3 + 2]))
         for i in range(n_total)
     ]
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_obj = curves_obj.evaluated_get(depsgraph)
+    eval_attr = eval_obj.data.attributes.get("position")
+    if eval_attr is not None and len(eval_attr.data) == n_total:
+        eval_flat = [0.0] * (n_total * 3)
+        eval_attr.data.foreach_get("vector", eval_flat)
+        eval_world_m = eval_obj.matrix_world
+        eval_world_pts = [
+            eval_world_m @ Vector((eval_flat[i * 3], eval_flat[i * 3 + 1], eval_flat[i * 3 + 2]))
+            for i in range(n_total)
+        ]
+    else:
+        eval_world_pts = [point.copy() for point in raw_world_pts]
+    eval_offset_pts = [
+        eval_world_pts[i] - raw_world_pts[i]
+        for i in range(n_total)
+    ]
+    world_pts = [point.copy() for point in eval_world_pts]
     root_outward_dirs: list[Vector | None] = []
     for start, count in spans:
         if count < 2:
@@ -754,8 +773,8 @@ def settle_hair_back(
             )
 
     out = []
-    for point in world_pts:
-        local = world_inv @ point
+    for index, point in enumerate(world_pts):
+        local = world_inv @ (point - eval_offset_pts[index])
         out.extend((local.x, local.y, local.z))
     attr.data.foreach_set("vector", out)
     curves_obj.data.update_tag()

@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "tokoya"
-version = "0.6.2"
+version = "0.6.3"
 name = "Tokoya"
 tagline = "Tokoya (床屋, barber) — mask planting and long-hair grooming"
 maintainer = "Yoshihiko Tsukamoto <ysk424@hotmail.com>"

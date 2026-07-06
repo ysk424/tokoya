@@ -3,6 +3,26 @@
 This file is a handoff log for Claude Code sessions.
 **Read this first** before touching anything in this repo.
 
+## v0.6.3 Settle evaluated-coordinate fix (2026-07-07)
+
+Root cause of scalp penetration after `Settle Hair Back`: `_initial_groom.py`
+was solving in raw Curves object coordinates while the visible hair used the
+evaluated Surface Deform result. In the measured scene, raw and evaluated
+positions differed by about 27.5 mm on average and up to about 39.8 mm, so a
+raw-space collision pass could still display inside the scalp.
+
+Fix: read both raw and evaluated Curves positions, solve the initial groom in
+evaluated world space, then write back `target_eval_world - eval_offset` so the
+modifier reconstructs the solved visible positions. This mirrors the established
+offset-compensation pattern in `_world_passthrough.py` and `_mesh_ops.py`.
+
+Known limitation: small residual issues around the ears are expected from the
+filled Body collider proxy. The proxy intentionally removes ear protrusion faces
+before filling holes so closed-inside parity checks remain stable; therefore its
+ear-area collision shape does not exactly match the visible Body mesh.
+
+---
+
 ## v0.6.2 Yurameki Settle migration (2026-07-05)
 
 Long straight hair setup is now split by responsibility:
