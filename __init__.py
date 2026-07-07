@@ -529,7 +529,7 @@ class TOKOYA_OT_mesh_shrink(Operator):
             t = ref.type if ref else "not found"
             self.report({"ERROR"},
                 f"Ref Object must be MESH (got {t}). "
-                "Ellipse/Circle are CURVE — use UV Sphere scaled to ellipsoid instead.")
+                "Ellipse/Circle are CURVE - use UV Sphere scaled to ellipsoid instead.")
             return {"CANCELLED"}
         from . import _mesh_ops
         n = _mesh_ops.mesh_shrink(obj, ref)

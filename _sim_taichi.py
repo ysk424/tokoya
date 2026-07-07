@@ -147,7 +147,7 @@ def get_solver_class(backend: str = "CUDA"):
             self.point1s.from_numpy(point1_np)
 
         # ------------------------------------------------------------------ #
-        # Kernels — scalar arguments only
+        # Kernels - scalar arguments only
         # ------------------------------------------------------------------ #
 
         @ti.kernel
@@ -157,11 +157,11 @@ def get_solver_class(backend: str = "CUDA"):
         ):
             """Apply gravity, advance free particles; set kinematic points.
 
-            k == 0: root — driven by head animation (roots field).
-            k == 1: follicle anchor — fixed at root + seg1_offset,
+            k == 0: root - driven by head animation (roots field).
+            k == 1: follicle anchor - fixed at root + seg1_offset,
                     simulating the skin-embedded hair follicle that locks
                     the first segment to the scalp growth direction.
-            k >= 2: free particles — gravity + XPBD constraints.
+            k >= 2: free particles - gravity + XPBD constraints.
             """
             for i in range(self.n_total):
                 s = i // self.pps
@@ -187,7 +187,7 @@ def get_solver_class(backend: str = "CUDA"):
             root_bend_ke: ti.f32, bend_ke: ti.f32,
             do_bend: int,
         ):
-            """XPBD distance constraints — parallel over strands,
+            """XPBD distance constraints - parallel over strands,
             sequential within each strand (Gauss-Seidel).
 
             Bending stiffness gradient: first 2 bending springs from root
@@ -362,7 +362,7 @@ def get_solver_class(backend: str = "CUDA"):
 
 
 # ------------------------------------------------------------------ #
-# Body collision (Python / Blender BVHTree — called after run_frame)
+# Body collision (Python / Blender BVHTree - called after run_frame)
 # ------------------------------------------------------------------ #
 
 def build_body_bvh(body_name: str):

@@ -14,6 +14,24 @@ def _version():
         return "?"
 
 
+def _label(layout, text: str) -> None:
+    layout.label(text=text, translate=False)
+
+
+def _prop(layout, wm, name: str, *, text: str | None = None) -> None:
+    kwargs = {"translate": False}
+    if text is not None:
+        kwargs["text"] = text
+    layout.prop(wm, name, **kwargs)
+
+
+def _operator(layout, op_id: str, *, text: str | None = None, icon: str = "NONE"):
+    kwargs = {"icon": icon, "translate": False}
+    if text is not None:
+        kwargs["text"] = text
+    return layout.operator(op_id, **kwargs)
+
+
 class TOKOYA_PT_main(Panel):
     bl_idname      = "TOKOYA_PT_main"
     bl_label       = "Tokoya"
@@ -26,61 +44,61 @@ class TOKOYA_PT_main(Panel):
         wm     = context.window_manager
 
         # Header
-        layout.label(text=f"Tokoya  v{_version()}")
+        _label(layout, f"Tokoya  v{_version()}")
         layout.separator(factor=0.3)
 
         # Plant parameters
         box = layout.box()
-        box.label(text="Mask Plant")
+        _label(box, "Mask Plant")
         col = box.column(align=True)
-        col.operator("tokoya.create_head_mask", icon="MESH_DATA")
-        col.prop(wm, "tokoya_strand_count")
-        col.prop(wm, "tokoya_max_length_cm")
+        _operator(col, "tokoya.create_head_mask", icon="MESH_DATA")
+        _prop(col, wm, "tokoya_strand_count")
+        _prop(col, wm, "tokoya_max_length_cm")
 
         # Persistent hair/body/clothes targets and temporary cutter target
         box = layout.box()
-        box.label(text="Objects")
+        _label(box, "Objects")
         col = box.column(align=True)
         row = col.row(align=True)
-        row.prop(wm, "tokoya_hair_obj", text="Hair")
-        row.operator("tokoya.pick_hair", text="", icon="EYEDROPPER")
+        _prop(row, wm, "tokoya_hair_obj", text="Hair")
+        _operator(row, "tokoya.pick_hair", text="", icon="EYEDROPPER")
         row = col.row(align=True)
-        row.prop(wm, "tokoya_body_obj", text="Body")
-        row.operator("tokoya.pick_body", text="", icon="EYEDROPPER")
+        _prop(row, wm, "tokoya_body_obj", text="Body")
+        _operator(row, "tokoya.pick_body", text="", icon="EYEDROPPER")
         row = col.row(align=True)
-        row.prop(wm, "tokoya_clothes_obj", text="Clothes")
-        row.operator("tokoya.pick_clothes", text="", icon="EYEDROPPER")
+        _prop(row, wm, "tokoya_clothes_obj", text="Clothes")
+        _operator(row, "tokoya.pick_clothes", text="", icon="EYEDROPPER")
         row = col.row(align=True)
-        row.prop(wm, "tokoya_cutter_obj", text="Cutter")
-        row.operator("tokoya.pick_cutter", text="", icon="EYEDROPPER")
+        _prop(row, wm, "tokoya_cutter_obj", text="Cutter")
+        _operator(row, "tokoya.pick_cutter", text="", icon="EYEDROPPER")
 
         layout.separator(factor=0.3)
 
         # Main buttons
         col = layout.column(align=True)
-        col.operator("tokoya.plant_hair",  icon="OUTLINER_OB_CURVES")
+        _operator(col, "tokoya.plant_hair", icon="OUTLINER_OB_CURVES")
 
         box = layout.box()
-        box.label(text="Settle Hair Back")
+        _label(box, "Settle Hair Back")
         col = box.column(align=True)
-        col.prop(wm, "tokoya_groom_radius_mm")
-        col.prop(wm, "tokoya_groom_follow_mm")
-        col.prop(wm, "tokoya_groom_release_mm")
-        col.operator("tokoya.settle_with_guide", icon="MOD_CLOTH")
-        col.operator("tokoya.simulate", icon="MOD_CLOTH")
+        _prop(col, wm, "tokoya_groom_radius_mm")
+        _prop(col, wm, "tokoya_groom_follow_mm")
+        _prop(col, wm, "tokoya_groom_release_mm")
+        _operator(col, "tokoya.settle_with_guide", icon="MOD_CLOTH")
+        _operator(col, "tokoya.simulate", icon="MOD_CLOTH")
 
         box = layout.box()
-        box.label(text="Cut / Reset")
+        _label(box, "Cut / Reset")
 
         col = box.column(align=True)
         col.separator()
-        col.operator("tokoya.mesh_shrink",  icon="MOD_SOLIDIFY")
+        _operator(col, "tokoya.mesh_shrink", icon="MOD_SOLIDIFY")
         row = col.row(align=True)
-        row.prop(wm, "tokoya_bangs_side_extra_cm", text="Side +cm")
-        row.prop(wm, "tokoya_bangs_z_extra_cm", text="Z +cm")
-        col.operator("tokoya.trim_bangs", icon="MOD_SOLIDIFY")
+        _prop(row, wm, "tokoya_bangs_side_extra_cm", text="Side +cm")
+        _prop(row, wm, "tokoya_bangs_z_extra_cm", text="Z +cm")
+        _operator(col, "tokoya.trim_bangs", icon="MOD_SOLIDIFY")
         col.separator()
-        col.operator("tokoya.urchin_reset", icon="FORCE_FORCE")
+        _operator(col, "tokoya.urchin_reset", icon="FORCE_FORCE")
 
 
 _classes = (TOKOYA_PT_main,)

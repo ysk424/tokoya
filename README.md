@@ -1,88 +1,105 @@
-# Tokoya
+# Tokoya 0.6.9
 
-Tokoya（床屋、英語では *barber*）は、Blender 5.1用のヘアースタイリング拡張です。グレースケールの頭皮マスクから毛を植え、Settle Hair Backでロングストレート向けに初期整形し、メッシュで切りそろえます。
+Tokoya is a Blender extension for generating and preparing
+VR-character-style long straight hair from a grayscale scalp mask.
 
-## 主な機能
+Tokoya and Yurameki are designed as one workflow: Tokoya plants, cuts, resets,
+and settles the hair; Yurameki then simulates the already-groomed Curves object.
 
-- 白＝0 cm、黒＝最大長のUVペイントマスク
-- 4,000本を既定値とする面積一様な植毛
-- 長さに応じて9～13点を自動選択するストランド
-- 根元2セグメントを最長毛基準で揃えるNatural Root Spacing
-- Hair / Body / Clothes / Cutter の明示選択
-- v0.6.8: `Settle With Guide`を一時メッシュ衝突から数式Back Flow Guideへ変更
-- v0.6.7: Back Flow Guideを肩の後ろ下まで延長し、Settleボタン配置を整理
-- v0.6.6: 球の代わりに一時Back Flow Guideを使う`Settle With Guide`
-- v0.6.5: `Trim Bangs`の一時カッターとSettle用Collider Proxyを処理後に削除
-- v0.6.4: 目の位置から前髪カッターを自動生成する`Trim Bangs`
-- v0.6.3: `Settle Hair Back`をSurface Deform後の表示座標で処理
-- v0.6.2: 旧`Simulate`ボタンを`Settle Hair Back`へ置換
-- Settle実行時、Body用の穴埋めCollider Proxyが無ければ自動生成
-- Body ProxyとClothesを使ったCPU BVH初期整形
-- `Mesh Shrink`による平面・球などを使ったカット
-- `Urchin Reset`による直毛状態への復帰
+## Installation
 
-セルフコリジョンは実装していません。
+- Blender 5.1 or newer. Current workflow testing is on Blender 5.2 beta.
+- Windows x64.
 
-## 必要環境
+Install the release ZIP through Blender's extension/add-on installer:
 
-- Blender 5.1以降
-- Windows x64
+```text
+dist/tokoya-0.6.9.zip
+```
 
-## インストール
+## Main Features
 
-1. [Releases](../../releases)から最新の`tokoya-*.zip`をダウンロードします。
-2. Blenderの`Edit > Preferences > Extensions`を開きます。
-3. メニューから`Install from Disk`を選び、ZIPを指定します。
-4. 3D ViewのNパネルに`Tokoya`タブが表示されます。
+- UV scalp-mask based hair planting.
+- White mask pixels create 0 cm hair; black pixels create maximum-length hair.
+- Area-uniform planting with `4,000` strands by default.
+- Automatic strand point count from 9 to 13 points based on `Max Length`.
+- Natural Root Spacing: the first two root-side segments share the maximum-hair
+  spacing so long and short hair flow consistently near the scalp.
+- Explicit Hair, Body, Clothes, and Cutter object selection.
+- `Settle Hair Back` for initial long-hair grooming.
+- `Settle With Guide` using a numeric Back Flow Guide instead of temporary mesh
+  collision.
+- Filled Body Collider Proxy for settle-time Body collision.
+- Optional Clothes collision during settling.
+- `Mesh Shrink` for plane/sphere/mesh-based cutting.
+- `Trim Bangs` for automatic bang cutter generation near the eye region.
+- `Urchin Reset` for restoring straight hair.
 
-## 基本操作
+Hair-hair collision is not implemented.
 
-1. 空のHair Curvesオブジェクトを作り、`Hair`へ設定します。
-2. `Body`へアニメーション追従対象兼コライダーのMeshを設定します。
-3. `Create Head Mask`で白いペイント用メッシュを作ります。
-4. Texture Paintで毛を生やす範囲を黒または灰色で塗ります。
-5. `Plant Hair`で植毛します。
-6. `Settle Hair Back`で背中方向へ初期整形します。
-   前側に残る毛をより強く後ろへ流す場合は`Settle With Guide`を使います。
-7. 必要に応じてCutter Meshを指定し、`Mesh Shrink`で切りそろえます。
-8. 前髪は`Side +cm`と`Z +cm`を調整し、`Trim Bangs`で目の上に自動カッターを作って切りそろえます。
+## Basic Workflow
+
+1. Create an empty Hair Curves object and assign it to `Hair`.
+2. Assign the animated body mesh to `Body`.
+3. Run `Create Head Mask` to create a white paint mesh above the scalp.
+4. Use Texture Paint to paint the hair region black or gray.
+5. Run `Plant Hair`.
+6. Run `Settle Hair Back` for initial back/down long-hair grooming.
+7. Use `Settle With Guide` when front-side hair needs stronger back flow.
+8. Assign a Cutter mesh when needed and run `Mesh Shrink`.
+9. Use `Trim Bangs` with `Side +cm` and `Z +cm` for bang trimming near the eyes.
+10. Pass the groomed Hair Curves object to Yurameki for simulation.
 
 ## Natural Root Spacing
 
-`Max Length`から全ストランド共通の点数を選びます。
+Tokoya chooses one point count for all strands from `Max Length`.
 
 ```text
 points = clamp(9 + floor((Max Length cm - 20) / 10), 9, 13)
 ```
 
-黒い最大長の毛を基準に、根元2セグメントは全ストランドで同じ長さに揃えます。
-灰色マスクで短く生えた毛や`Mesh Shrink`で短く切られた毛は、その共通Root
-Zoneを保ったまま残りを均等割りします。Root Zoneより短い毛だけは、全体を
-その長さへ圧縮します。
+The longest hair defines the root zone. Shorter hair created by gray mask pixels
+or `Mesh Shrink` keeps that shared root zone when possible, then distributes the
+remaining length evenly. Hair shorter than the root zone is compressed over the
+whole strand.
 
-これにより、長い毛と短い毛が混在しても頭皮付近の関節位置が揃い、根元の流れが
-乱れにくくなります。
+This keeps long and short hair aligned near the scalp and reduces visible root
+flow disorder.
 
-## マスクの意味
+## Mask Meaning
 
 ```text
-毛の長さ = (255 - 画素値) / 255 × Max Length
+hair length = (255 - pixel_value) / 255 * Max Length
 ```
 
-- 白（255）：0 cm
-- 灰色：約半分の長さ
-- 黒（0）：最大長
+- White (`255`): 0 cm.
+- Gray: partial length.
+- Black (`0`): maximum length.
 
 ## Settle Hair Back
 
-Bodyから穴埋め済みCollider Proxyを自動作成し、Clothesが指定されていれば同時にBVHへ入れます。頭頂部のカーブを保ちながら、下側のロングヘアを背中方向と下方向へ整えるCPU BVH初期整形です。
+Tokoya builds a filled Body Collider Proxy when needed. If Clothes is assigned,
+Clothes is included in the settle BVH as well. The settle path is a CPU BVH
+initial-grooming pass that keeps the crown shape while moving lower long hair
+backward and downward.
 
-Surface DeformなどのモディファイアがあるHair Curvesでは、表示されているevaluated world座標で整髪と衝突判定を行い、モディファイアoffsetを差し引いてCurvesの元データへ書き戻します。
+For Hair Curves with modifiers such as Surface Deform, Tokoya reads evaluated
+world-space coordinates, performs grooming and collision checks there, then
+writes back to the original Curves data after subtracting the modifier offset.
 
-既知の制限として、Body用Collider Proxyは穴埋め済みの閉じた判定形状を作るため、耳の突起を一部除去します。そのため耳まわりだけは実Bodyと衝突形状が完全一致せず、軽いめり込みや手直しが残ることがあります。
+The Body Collider Proxy is a closed collision shape. It caps Body boundary loops
+and removes some ear protrusion geometry, so the proxy may not exactly match the
+visible Body around the ears.
 
-Head MaskはBody表面から1 mm外側に生成されます。
+The Head Mask is generated 1 mm outside the Body surface.
 
-## ライセンス
+## 0.6.9 Release
+
+- Public README and manifest text are English.
+- UI labels are kept English even when Blender's UI language is Japanese.
+- This release is intended as the Tokoya side of the Tokoya + Yurameki public
+  long-straight-hair workflow.
+
+## License
 
 [MIT License](LICENSE)

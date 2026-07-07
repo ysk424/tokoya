@@ -1,4 +1,4 @@
-"""Tokoya — geometric hair operations.
+"""Tokoya - geometric hair operations.
 
 Coordinate convention
 ---------------------
@@ -56,7 +56,7 @@ def _points_per_curve(curves_obj: bpy.types.Object) -> int:
 
 
 def _read_world_eval(curves_obj: bpy.types.Object) -> np.ndarray:
-    """Return (n_total, 3) float32 in WORLD space — uses evaluated mesh
+    """Return (n_total, 3) float32 in WORLD space - uses evaluated mesh
     so the Surface Deform modifier offset is included.
 
     This is the position the user *sees*, and should be used for all
@@ -215,7 +215,7 @@ def mesh_shrink(curves_obj: bpy.types.Object, ref_mesh_obj: bpy.types.Object) ->
             continue  # no intersection at all
         hit_arc = min(all_hits)   # ← shortest arc from root = cut point
         if hit_arc >= total:
-            continue  # intersection is beyond tip — nothing to cut
+            continue  # intersection is beyond tip - nothing to cut
 
         scale = hit_arc / total
         from . import _mask_plant
