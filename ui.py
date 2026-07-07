@@ -59,7 +59,6 @@ class TOKOYA_PT_main(Panel):
         # Main buttons
         col = layout.column(align=True)
         col.operator("tokoya.plant_hair",  icon="OUTLINER_OB_CURVES")
-        col.operator("tokoya.simulate",     icon="MOD_CLOTH")
 
         box = layout.box()
         box.label(text="Settle Hair Back")
@@ -67,6 +66,8 @@ class TOKOYA_PT_main(Panel):
         col.prop(wm, "tokoya_groom_radius_mm")
         col.prop(wm, "tokoya_groom_follow_mm")
         col.prop(wm, "tokoya_groom_release_mm")
+        col.operator("tokoya.settle_with_guide", icon="MOD_CLOTH")
+        col.operator("tokoya.simulate", icon="MOD_CLOTH")
 
         box = layout.box()
         box.label(text="Cut / Reset")
@@ -74,6 +75,10 @@ class TOKOYA_PT_main(Panel):
         col = box.column(align=True)
         col.separator()
         col.operator("tokoya.mesh_shrink",  icon="MOD_SOLIDIFY")
+        row = col.row(align=True)
+        row.prop(wm, "tokoya_bangs_side_extra_cm", text="Side +cm")
+        row.prop(wm, "tokoya_bangs_z_extra_cm", text="Z +cm")
+        col.operator("tokoya.trim_bangs", icon="MOD_SOLIDIFY")
         col.separator()
         col.operator("tokoya.urchin_reset", icon="FORCE_FORCE")
 

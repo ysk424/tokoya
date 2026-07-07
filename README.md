@@ -9,6 +9,10 @@ Tokoya（床屋、英語では *barber*）は、Blender 5.1用のヘアースタ
 - 長さに応じて9～13点を自動選択するストランド
 - 根元2セグメントを最長毛基準で揃えるNatural Root Spacing
 - Hair / Body / Clothes / Cutter の明示選択
+- v0.6.7: Back Flow Guideを肩の後ろ下まで延長し、Settleボタン配置を整理
+- v0.6.6: 球の代わりに一時Back Flow Guideを使う`Settle With Guide`
+- v0.6.5: `Trim Bangs`の一時カッターとSettle用Collider Proxyを処理後に削除
+- v0.6.4: 目の位置から前髪カッターを自動生成する`Trim Bangs`
 - v0.6.3: `Settle Hair Back`をSurface Deform後の表示座標で処理
 - v0.6.2: 旧`Simulate`ボタンを`Settle Hair Back`へ置換
 - Settle実行時、Body用の穴埋めCollider Proxyが無ければ自動生成
@@ -38,7 +42,9 @@ Tokoya（床屋、英語では *barber*）は、Blender 5.1用のヘアースタ
 4. Texture Paintで毛を生やす範囲を黒または灰色で塗ります。
 5. `Plant Hair`で植毛します。
 6. `Settle Hair Back`で背中方向へ初期整形します。
+   前側に残る毛をより強く後ろへ流す場合は`Settle With Guide`を使います。
 7. 必要に応じてCutter Meshを指定し、`Mesh Shrink`で切りそろえます。
+8. 前髪は`Side +cm`と`Z +cm`を調整し、`Trim Bangs`で目の上に自動カッターを作って切りそろえます。
 
 ## Natural Root Spacing
 

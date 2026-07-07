@@ -6,6 +6,7 @@ from bpy.props import (
     IntProperty, StringProperty,
 )
 from bpy.types import Operator, WindowManager
+from mathutils import Vector
 from . import ui
 
 
@@ -61,7 +62,7 @@ def _set_curves_surface(curves_obj, surface_obj):
         curves_obj.data.surface_uv_map = surface_obj.data.uv_layers.active.name
 
 
-def _settle_colliders(context):
+def _settle_colliders(context, extra_clothes=None, include_manual_clothes=True):
     from . import _collider_proxy
 
     wm = context.window_manager
@@ -94,10 +95,330 @@ def _settle_colliders(context):
         proxy_created = True
 
     colliders = [proxy if proxy is not None else body]
-    clothes = _source_clothes_collider(context)
+    clothes = _source_clothes_collider(context) if include_manual_clothes else None
     if clothes is not None:
         colliders.append(clothes)
-    return colliders, proxy_created
+    for extra in extra_clothes or ():
+        if extra is not None and extra.type == "MESH":
+            colliders.append(extra)
+    proxy_name = proxy.name if proxy is not None else ""
+    return colliders, proxy_created, proxy_name
+
+
+def _remove_mesh_object(obj):
+    if obj is None:
+        return
+    mesh = obj.data if obj.type == "MESH" else None
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh is not None and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+
+
+def _clear_settle_proxy(context, proxy_name=""):
+    from . import _collider_proxy
+
+    wm = context.window_manager
+    names = set()
+    if proxy_name:
+        names.add(proxy_name)
+    stored_name = getattr(wm, "tokoya_collider_proxy_obj", "").strip()
+    if stored_name:
+        names.add(stored_name)
+
+    body = _source_body_collider(context)
+    if body is not None:
+        for obj in list(bpy.data.objects):
+            if (
+                obj.type == "MESH"
+                and bool(obj.get(_collider_proxy.PROXY_FLAG, False))
+                and obj.get(_collider_proxy.PROXY_SOURCE) == body.name
+            ):
+                names.add(obj.name)
+
+    for name in names:
+        _collider_proxy.clear_proxy(name)
+    wm.tokoya_collider_proxy_obj = ""
+
+
+def _clear_auto_bangs_cutter(context, cutter):
+    if cutter is None:
+        return
+    name = cutter.name
+    if bpy.data.objects.get(name) is None:
+        return
+    if cutter.get("tokoya_source") == "auto_bangs_trim":
+        _remove_mesh_object(cutter)
+        if context.window_manager.tokoya_cutter_obj == name:
+            context.window_manager.tokoya_cutter_obj = ""
+
+
+def _clear_back_flow_guide(guide):
+    if guide is None:
+        return
+    name = guide.name
+    obj = bpy.data.objects.get(name)
+    if obj is not None and obj.get("tokoya_source") == "auto_back_flow_guide":
+        _remove_mesh_object(obj)
+
+
+def _object_world_bounds(obj):
+    corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+    return {
+        "min_x": min(point.x for point in corners),
+        "max_x": max(point.x for point in corners),
+        "min_y": min(point.y for point in corners),
+        "max_y": max(point.y for point in corners),
+        "min_z": min(point.z for point in corners),
+        "max_z": max(point.z for point in corners),
+    }
+
+
+def _mesh_world_points(obj):
+    deps = bpy.context.evaluated_depsgraph_get()
+    eval_obj = obj.evaluated_get(deps)
+    mesh = eval_obj.to_mesh()
+    try:
+        mat = eval_obj.matrix_world.copy()
+        return [mat @ v.co for v in mesh.vertices]
+    finally:
+        eval_obj.to_mesh_clear()
+
+
+def _find_eye_source_objects():
+    exact_groups = (
+        ("CC_Base_EyeOcclusion",),
+        ("CC_Base_TearLine",),
+        ("CC_Base_Eye",),
+    )
+    for names in exact_groups:
+        objs = [
+            bpy.data.objects.get(name)
+            for name in names
+            if bpy.data.objects.get(name) is not None
+            and bpy.data.objects.get(name).type == "MESH"
+        ]
+        if objs:
+            return objs
+
+    pattern_groups = (
+        ("eyeocclusion", "eye_occlusion"),
+        ("tearline", "tear_line"),
+        ("eye",),
+    )
+    for patterns in pattern_groups:
+        objs = []
+        for obj in bpy.data.objects:
+            if obj.type != "MESH":
+                continue
+            name = obj.name.lower()
+            if "lash" in name or "brow" in name:
+                continue
+            if any(pattern in name for pattern in patterns):
+                objs.append(obj)
+        if objs:
+            return objs
+    return []
+
+
+def _detect_eye_opening_bounds():
+    sources = _find_eye_source_objects()
+    if not sources:
+        raise RuntimeError("Could not find an eye mesh such as CC_Base_EyeOcclusion")
+
+    pts = []
+    for obj in sources:
+        pts.extend(_mesh_world_points(obj))
+    if not pts:
+        names = ", ".join(obj.name for obj in sources)
+        raise RuntimeError(f"Eye mesh has no evaluated vertices: {names}")
+
+    return {
+        "source_names": [obj.name for obj in sources],
+        "min_x": min(p.x for p in pts),
+        "max_x": max(p.x for p in pts),
+        "min_y": min(p.y for p in pts),
+        "max_y": max(p.y for p in pts),
+        "min_z": min(p.z for p in pts),
+        "max_z": max(p.z for p in pts),
+    }
+
+
+def _material_for_bangs_cutter():
+    mat = bpy.data.materials.get("Tokoya_BangsAutoCutter_Material")
+    if mat is None:
+        mat = bpy.data.materials.new("Tokoya_BangsAutoCutter_Material")
+    mat.diffuse_color = (1.0, 0.45, 0.05, 0.45)
+    try:
+        mat.use_nodes = True
+        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        if bsdf is not None:
+            if "Base Color" in bsdf.inputs:
+                bsdf.inputs["Base Color"].default_value = (1.0, 0.45, 0.05, 0.45)
+            if "Alpha" in bsdf.inputs:
+                bsdf.inputs["Alpha"].default_value = 0.45
+        mat.blend_method = "BLEND"
+    except Exception:
+        pass
+    return mat
+
+
+def _create_bangs_cutter(context, side_extra_cm, z_extra_cm):
+    bounds = _detect_eye_opening_bounds()
+    side_extra_m = max(0.0, float(side_extra_cm)) * 0.01
+    z_extra_m = max(0.0, float(z_extra_cm)) * 0.01
+
+    left_x = bounds["min_x"] - side_extra_m
+    right_x = bounds["max_x"] + side_extra_m
+    center_y = bounds["min_y"] - 0.020
+    y0 = center_y - 0.050
+    y1 = center_y + 0.050
+    z = bounds["max_z"] + z_extra_m
+
+    mesh = bpy.data.meshes.new("Tokoya_BangsAutoCutter_Mesh")
+    verts = [
+        (left_x, y0, z),
+        (right_x, y0, z),
+        (right_x, y1, z),
+        (left_x, y1, z),
+    ]
+    mesh.from_pydata(verts, [], [(0, 1, 2, 3)])
+    mesh.update()
+    mesh.materials.append(_material_for_bangs_cutter())
+
+    obj = bpy.data.objects.get("Tokoya_BangsAutoCutter")
+    if obj is not None and obj.type == "MESH":
+        old_mesh = obj.data
+        obj.data = mesh
+        obj.location = (0.0, 0.0, 0.0)
+        obj.rotation_euler = (0.0, 0.0, 0.0)
+        obj.scale = (1.0, 1.0, 1.0)
+        if old_mesh.users == 0:
+            bpy.data.meshes.remove(old_mesh)
+    else:
+        obj = bpy.data.objects.new("Tokoya_BangsAutoCutter", mesh)
+        context.scene.collection.objects.link(obj)
+
+    if not obj.users_collection:
+        context.scene.collection.objects.link(obj)
+    obj.hide_render = True
+    obj.show_in_front = True
+    obj["tokoya_source"] = "auto_bangs_trim"
+    obj["tokoya_eye_sources"] = ",".join(bounds["source_names"])
+    obj["tokoya_side_extra_cm"] = float(side_extra_cm)
+    obj["tokoya_z_extra_cm"] = float(z_extra_cm)
+    obj["tokoya_width_m"] = float(right_x - left_x)
+    obj["tokoya_y_span_m"] = 0.100
+    obj["tokoya_z_m"] = float(z)
+    context.window_manager.tokoya_cutter_obj = obj.name
+    return obj, bounds
+
+
+def _material_for_back_flow_guide():
+    mat = bpy.data.materials.get("Tokoya_BackFlowGuide_Material")
+    if mat is None:
+        mat = bpy.data.materials.new("Tokoya_BackFlowGuide_Material")
+    mat.diffuse_color = (0.05, 0.42, 1.0, 0.28)
+    try:
+        mat.use_nodes = True
+        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        if bsdf is not None:
+            if "Base Color" in bsdf.inputs:
+                bsdf.inputs["Base Color"].default_value = (0.05, 0.42, 1.0, 0.28)
+            if "Alpha" in bsdf.inputs:
+                bsdf.inputs["Alpha"].default_value = 0.28
+        mat.blend_method = "BLEND"
+    except Exception:
+        pass
+    return mat
+
+
+def _create_back_flow_guide(context):
+    body = _source_body_collider(context)
+    if body is None:
+        raise RuntimeError("Select a Body Mesh first")
+
+    body_bounds = _object_world_bounds(body)
+    try:
+        eye_bounds = _detect_eye_opening_bounds()
+    except RuntimeError:
+        eye_bounds = None
+
+    if eye_bounds is not None:
+        eye_width = eye_bounds["max_x"] - eye_bounds["min_x"]
+        center_x = (eye_bounds["min_x"] + eye_bounds["max_x"]) * 0.5
+        front_y = min(body_bounds["min_y"], eye_bounds["min_y"])
+        top_z = min(body_bounds["max_z"] - 0.025, eye_bounds["max_z"] + 0.10)
+        bottom_z = max(body_bounds["min_z"] + 0.86, top_z - 0.78)
+    else:
+        eye_width = 0.18
+        center_x = (body_bounds["min_x"] + body_bounds["max_x"]) * 0.5
+        front_y = body_bounds["min_y"]
+        top_z = body_bounds["max_z"] - 0.035
+        bottom_z = max(body_bounds["min_z"] + 0.86, top_z - 0.78)
+
+    width = max(0.64, min(0.78, eye_width + 0.50))
+    half_width = width * 0.5
+    x0 = center_x - half_width
+    x1 = center_x + half_width
+
+    thickness = 0.090
+    top_center_y = front_y - 0.080
+    bottom_center_y = max(body_bounds["max_y"] + 0.090, front_y + 0.300)
+    top_front_y = top_center_y - thickness * 0.5
+    top_back_y = top_center_y + thickness * 0.5
+    bottom_front_y = bottom_center_y - thickness * 0.5
+    bottom_back_y = bottom_center_y + thickness * 0.5
+
+    existing = bpy.data.objects.get("Tokoya_BackFlowGuide")
+    if existing is not None and existing.get("tokoya_source") == "auto_back_flow_guide":
+        _remove_mesh_object(existing)
+
+    mesh = bpy.data.meshes.new("Tokoya_BackFlowGuide_Mesh")
+    verts = [
+        (x0, bottom_front_y, bottom_z),
+        (x1, bottom_front_y, bottom_z),
+        (x1, bottom_back_y, bottom_z),
+        (x0, bottom_back_y, bottom_z),
+        (x0, top_front_y, top_z),
+        (x1, top_front_y, top_z),
+        (x1, top_back_y, top_z),
+        (x0, top_back_y, top_z),
+    ]
+    faces = [
+        (0, 3, 2, 1),
+        (4, 5, 6, 7),
+        (0, 1, 5, 4),
+        (3, 7, 6, 2),
+        (0, 4, 7, 3),
+        (1, 2, 6, 5),
+    ]
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+    mesh.materials.append(_material_for_back_flow_guide())
+
+    obj = bpy.data.objects.new("Tokoya_BackFlowGuide", mesh)
+    context.scene.collection.objects.link(obj)
+    obj.hide_render = True
+    obj.display_type = "WIRE"
+    obj.show_in_front = True
+    obj["tokoya_source"] = "auto_back_flow_guide"
+    obj["tokoya_width_m"] = float(width)
+    obj["tokoya_thickness_m"] = float(thickness)
+    obj["tokoya_bottom_z_m"] = float(bottom_z)
+    obj["tokoya_top_z_m"] = float(top_z)
+    obj["tokoya_top_center_y_m"] = float(top_center_y)
+    obj["tokoya_bottom_center_y_m"] = float(bottom_center_y)
+
+    bevel = obj.modifiers.new("Tokoya round guide edges", "BEVEL")
+    bevel.width = 0.025
+    bevel.segments = 5
+    bevel.profile = 0.5
+    try:
+        obj.modifiers.new("Tokoya guide normals", "WEIGHTED_NORMAL")
+    except RuntimeError:
+        pass
+
+    return obj
 
 
 def _mark_hair_changed():
@@ -190,10 +511,11 @@ class TOKOYA_OT_simulate(Operator):
         if obj is None:
             self.report({"ERROR"}, "Pick one Hair Curves object"); return {"CANCELLED"}
         wm = context.window_manager
+        proxy_name = ""
         try:
             from . import _initial_groom
 
-            colliders, proxy_created = _settle_colliders(context)
+            colliders, proxy_created, proxy_name = _settle_colliders(context)
             stats = _initial_groom.settle_hair_back(
                 obj,
                 colliders,
@@ -205,6 +527,8 @@ class TOKOYA_OT_simulate(Operator):
         except Exception as exc:
             self.report({"ERROR"}, f"Settle Hair Back failed: {exc!r}")
             return {"CANCELLED"}
+        finally:
+            _clear_settle_proxy(context, proxy_name)
         _mark_hair_changed()
         proxy_note = "proxy created, " if proxy_created else ""
         self.report(
@@ -217,6 +541,56 @@ class TOKOYA_OT_simulate(Operator):
             f"root_lock={stats.get('normal_root_locks', 0)}, "
             f"turn={stats.get('angle_limited_rods', 0)}, "
             f"lower_free={stats.get('lower_free_rods', 0)}, "
+            f"tip_down={stats['avg_tip_down_dot']:.3f}",
+        )
+        return {"FINISHED"}
+
+
+class TOKOYA_OT_settle_with_guide(Operator):
+    bl_idname = "tokoya.settle_with_guide"
+    bl_label = "Settle With Guide"
+    bl_description = "Settle hair back using a temporary slanted guide mesh instead of the Clothes object"
+
+    def execute(self, context):
+        obj = _find_curves_obj(context)
+        if obj is None:
+            self.report({"ERROR"}, "Pick one Hair Curves object")
+            return {"CANCELLED"}
+        wm = context.window_manager
+        proxy_name = ""
+        guide = None
+        try:
+            from . import _initial_groom
+
+            guide = _create_back_flow_guide(context)
+            colliders, proxy_created, proxy_name = _settle_colliders(
+                context,
+                extra_clothes=(guide,),
+                include_manual_clothes=False,
+            )
+            stats = _initial_groom.settle_hair_back(
+                obj,
+                colliders,
+                max_strands=0,
+                collision_radius_m=float(wm.tokoya_groom_radius_mm) * 1.0e-3,
+                follow_radius_m=float(wm.tokoya_groom_follow_mm) * 1.0e-3,
+                release_probe_m=float(wm.tokoya_groom_release_mm) * 1.0e-3,
+            )
+        except Exception as exc:
+            self.report({"ERROR"}, f"Settle With Guide failed: {exc!r}")
+            return {"CANCELLED"}
+        finally:
+            _clear_settle_proxy(context, proxy_name)
+            _clear_back_flow_guide(guide)
+        _mark_hair_changed()
+        proxy_note = "proxy created, " if proxy_created else ""
+        self.report(
+            {"INFO"},
+            f"Settle With Guide: {proxy_note}"
+            f"strands={stats['processed_strands']}, "
+            f"time={stats['elapsed_sec']:.2f}s, "
+            f"len_err={stats['max_length_error_mm']:.6f}mm, "
+            f"close={stats['remaining_close_points']}, "
             f"tip_down={stats['avg_tip_down_dot']:.3f}",
         )
         return {"FINISHED"}
@@ -244,6 +618,43 @@ class TOKOYA_OT_mesh_shrink(Operator):
         n = _mesh_ops.mesh_shrink(obj, ref)
         _mark_hair_changed()
         self.report({"INFO"}, f"Shrunk {n} strands")
+        return {"FINISHED"}
+
+
+class TOKOYA_OT_trim_bangs(Operator):
+    bl_idname = "tokoya.trim_bangs"
+    bl_label = "Trim Bangs"
+    bl_description = "Create an eye-based cutter plane and run Mesh Shrink"
+
+    def execute(self, context):
+        obj = _find_curves_obj(context)
+        if obj is None:
+            self.report({"ERROR"}, "Pick one Hair Curves object")
+            return {"CANCELLED"}
+        wm = context.window_manager
+        cutter = None
+        cutter_name = ""
+        try:
+            cutter, bounds = _create_bangs_cutter(
+                context,
+                wm.tokoya_bangs_side_extra_cm,
+                wm.tokoya_bangs_z_extra_cm,
+            )
+            cutter_name = cutter.name
+            from . import _mesh_ops
+
+            n = _mesh_ops.mesh_shrink(obj, cutter)
+        except Exception as exc:
+            self.report({"ERROR"}, f"Trim Bangs failed: {exc}")
+            return {"CANCELLED"}
+        finally:
+            _clear_auto_bangs_cutter(context, cutter)
+        _mark_hair_changed()
+        self.report(
+            {"INFO"},
+            f"Trim Bangs: shrunk {n} strands, "
+            f"eye={'+'.join(bounds['source_names'])}, cutter={cutter_name}",
+        )
         return {"FINISHED"}
 
 
@@ -333,7 +744,9 @@ _classes = (
     TOKOYA_OT_create_head_mask,
     TOKOYA_OT_plant_hair,
     TOKOYA_OT_simulate,
+    TOKOYA_OT_settle_with_guide,
     TOKOYA_OT_mesh_shrink,
+    TOKOYA_OT_trim_bangs,
     TOKOYA_OT_urchin_reset,
     TOKOYA_OT_pick_hair,
     TOKOYA_OT_pick_body,
@@ -397,6 +810,16 @@ def register():
         WindowManager.tokoya_cutter_obj = StringProperty(
             name="Cutter Mesh", description="Mesh used by Mesh Shrink",
             default="", options={"SKIP_SAVE"})
+        WindowManager.tokoya_bangs_side_extra_cm = FloatProperty(
+            name="Side + cm",
+            description="Extra width added to both eye-width ends for Trim Bangs",
+            default=1.0, min=0.0, max=50.0, step=10, precision=2,
+            options={"SKIP_SAVE"})
+        WindowManager.tokoya_bangs_z_extra_cm = FloatProperty(
+            name="Z + cm",
+            description="Height added above the detected eye top for Trim Bangs",
+            default=3.0, min=0.0, max=50.0, step=10, precision=2,
+            options={"SKIP_SAVE"})
         WindowManager.tokoya_groom_radius_mm = FloatProperty(
             name="Groom Radius mm",
             default=float(defaults.get("GROOM_RADIUS_MM", 2.5)),
@@ -451,6 +874,7 @@ def register():
             "tokoya_simulation_steps", "tokoya_compute_backend",
             "tokoya_hair_obj", "tokoya_body_obj", "tokoya_clothes_obj",
             "tokoya_collider_proxy_obj", "tokoya_cutter_obj",
+            "tokoya_bangs_side_extra_cm", "tokoya_bangs_z_extra_cm",
             "tokoya_groom_radius_mm", "tokoya_groom_follow_mm",
             "tokoya_groom_release_mm",
             "tokoya_spring_ke", "tokoya_damping", "tokoya_particle_mass",
@@ -478,6 +902,7 @@ def unregister():
         "tokoya_simulation_steps", "tokoya_compute_backend",
         "tokoya_hair_obj", "tokoya_body_obj", "tokoya_clothes_obj",
         "tokoya_collider_proxy_obj", "tokoya_cutter_obj",
+        "tokoya_bangs_side_extra_cm", "tokoya_bangs_z_extra_cm",
         "tokoya_groom_radius_mm", "tokoya_groom_follow_mm",
         "tokoya_groom_release_mm",
         "tokoya_spring_ke", "tokoya_damping", "tokoya_particle_mass",
