@@ -152,15 +152,6 @@ def _clear_auto_bangs_cutter(context, cutter):
             context.window_manager.tokoya_cutter_obj = ""
 
 
-def _clear_back_flow_guide(guide):
-    if guide is None:
-        return
-    name = guide.name
-    obj = bpy.data.objects.get(name)
-    if obj is not None and obj.get("tokoya_source") == "auto_back_flow_guide":
-        _remove_mesh_object(obj)
-
-
 def _object_world_bounds(obj):
     corners = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
     return {
@@ -313,26 +304,7 @@ def _create_bangs_cutter(context, side_extra_cm, z_extra_cm):
     return obj, bounds
 
 
-def _material_for_back_flow_guide():
-    mat = bpy.data.materials.get("Tokoya_BackFlowGuide_Material")
-    if mat is None:
-        mat = bpy.data.materials.new("Tokoya_BackFlowGuide_Material")
-    mat.diffuse_color = (0.05, 0.42, 1.0, 0.28)
-    try:
-        mat.use_nodes = True
-        bsdf = mat.node_tree.nodes.get("Principled BSDF")
-        if bsdf is not None:
-            if "Base Color" in bsdf.inputs:
-                bsdf.inputs["Base Color"].default_value = (0.05, 0.42, 1.0, 0.28)
-            if "Alpha" in bsdf.inputs:
-                bsdf.inputs["Alpha"].default_value = 0.28
-        mat.blend_method = "BLEND"
-    except Exception:
-        pass
-    return mat
-
-
-def _create_back_flow_guide(context):
+def _back_flow_guide_params(context):
     body = _source_body_collider(context)
     if body is None:
         raise RuntimeError("Select a Body Mesh first")
@@ -344,81 +316,26 @@ def _create_back_flow_guide(context):
         eye_bounds = None
 
     if eye_bounds is not None:
-        eye_width = eye_bounds["max_x"] - eye_bounds["min_x"]
-        center_x = (eye_bounds["min_x"] + eye_bounds["max_x"]) * 0.5
-        front_y = min(body_bounds["min_y"], eye_bounds["min_y"])
-        top_z = min(body_bounds["max_z"] - 0.025, eye_bounds["max_z"] + 0.10)
-        bottom_z = max(body_bounds["min_z"] + 0.86, top_z - 0.78)
+        eye_top_z = eye_bounds["max_z"]
+        face_front_y = min(body_bounds["min_y"], eye_bounds["min_y"])
+        z_top = min(body_bounds["max_z"] - 0.030, eye_top_z + 0.100)
+        z_shoulder = eye_top_z - 0.248
     else:
-        eye_width = 0.18
-        center_x = (body_bounds["min_x"] + body_bounds["max_x"]) * 0.5
-        front_y = body_bounds["min_y"]
-        top_z = body_bounds["max_z"] - 0.035
-        bottom_z = max(body_bounds["min_z"] + 0.86, top_z - 0.78)
+        face_front_y = body_bounds["min_y"]
+        z_top = body_bounds["max_z"] - 0.035
+        z_shoulder = z_top - 0.350
 
-    width = max(0.64, min(0.78, eye_width + 0.50))
-    half_width = width * 0.5
-    x0 = center_x - half_width
-    x1 = center_x + half_width
-
-    thickness = 0.090
-    top_center_y = front_y - 0.080
-    bottom_center_y = max(body_bounds["max_y"] + 0.090, front_y + 0.300)
-    top_front_y = top_center_y - thickness * 0.5
-    top_back_y = top_center_y + thickness * 0.5
-    bottom_front_y = bottom_center_y - thickness * 0.5
-    bottom_back_y = bottom_center_y + thickness * 0.5
-
-    existing = bpy.data.objects.get("Tokoya_BackFlowGuide")
-    if existing is not None and existing.get("tokoya_source") == "auto_back_flow_guide":
-        _remove_mesh_object(existing)
-
-    mesh = bpy.data.meshes.new("Tokoya_BackFlowGuide_Mesh")
-    verts = [
-        (x0, bottom_front_y, bottom_z),
-        (x1, bottom_front_y, bottom_z),
-        (x1, bottom_back_y, bottom_z),
-        (x0, bottom_back_y, bottom_z),
-        (x0, top_front_y, top_z),
-        (x1, top_front_y, top_z),
-        (x1, top_back_y, top_z),
-        (x0, top_back_y, top_z),
-    ]
-    faces = [
-        (0, 3, 2, 1),
-        (4, 5, 6, 7),
-        (0, 1, 5, 4),
-        (3, 7, 6, 2),
-        (0, 4, 7, 3),
-        (1, 2, 6, 5),
-    ]
-    mesh.from_pydata(verts, [], faces)
-    mesh.update()
-    mesh.materials.append(_material_for_back_flow_guide())
-
-    obj = bpy.data.objects.new("Tokoya_BackFlowGuide", mesh)
-    context.scene.collection.objects.link(obj)
-    obj.hide_render = True
-    obj.display_type = "WIRE"
-    obj.show_in_front = True
-    obj["tokoya_source"] = "auto_back_flow_guide"
-    obj["tokoya_width_m"] = float(width)
-    obj["tokoya_thickness_m"] = float(thickness)
-    obj["tokoya_bottom_z_m"] = float(bottom_z)
-    obj["tokoya_top_z_m"] = float(top_z)
-    obj["tokoya_top_center_y_m"] = float(top_center_y)
-    obj["tokoya_bottom_center_y_m"] = float(bottom_center_y)
-
-    bevel = obj.modifiers.new("Tokoya round guide edges", "BEVEL")
-    bevel.width = 0.025
-    bevel.segments = 5
-    bevel.profile = 0.5
-    try:
-        obj.modifiers.new("Tokoya guide normals", "WEIGHTED_NORMAL")
-    except RuntimeError:
-        pass
-
-    return obj
+    body_back_y = body_bounds["max_y"]
+    z_low = max(body_bounds["min_z"] + 0.850, z_shoulder - 0.380)
+    return {
+        "z_top": float(z_top),
+        "y_top": float(face_front_y - 0.035),
+        "z_shoulder": float(z_shoulder),
+        "y_shoulder": float(body_back_y + 0.065),
+        "z_low": float(z_low),
+        "y_low": float(body_back_y + 0.125),
+        "z_drop_m": 0.015,
+    }
 
 
 def _mark_hair_changed():
@@ -558,14 +475,13 @@ class TOKOYA_OT_settle_with_guide(Operator):
             return {"CANCELLED"}
         wm = context.window_manager
         proxy_name = ""
-        guide = None
+        guide_params = None
         try:
             from . import _initial_groom
 
-            guide = _create_back_flow_guide(context)
+            guide_params = _back_flow_guide_params(context)
             colliders, proxy_created, proxy_name = _settle_colliders(
                 context,
-                extra_clothes=(guide,),
                 include_manual_clothes=False,
             )
             stats = _initial_groom.settle_hair_back(
@@ -575,13 +491,13 @@ class TOKOYA_OT_settle_with_guide(Operator):
                 collision_radius_m=float(wm.tokoya_groom_radius_mm) * 1.0e-3,
                 follow_radius_m=float(wm.tokoya_groom_follow_mm) * 1.0e-3,
                 release_probe_m=float(wm.tokoya_groom_release_mm) * 1.0e-3,
+                back_flow_guide=guide_params,
             )
         except Exception as exc:
             self.report({"ERROR"}, f"Settle With Guide failed: {exc!r}")
             return {"CANCELLED"}
         finally:
             _clear_settle_proxy(context, proxy_name)
-            _clear_back_flow_guide(guide)
         _mark_hair_changed()
         proxy_note = "proxy created, " if proxy_created else ""
         self.report(
@@ -591,6 +507,7 @@ class TOKOYA_OT_settle_with_guide(Operator):
             f"time={stats['elapsed_sec']:.2f}s, "
             f"len_err={stats['max_length_error_mm']:.6f}mm, "
             f"close={stats['remaining_close_points']}, "
+            f"guide={stats.get('back_flow_guided_rods', 0)}, "
             f"tip_down={stats['avg_tip_down_dot']:.3f}",
         )
         return {"FINISHED"}

@@ -9,6 +9,7 @@ Tokoya（床屋、英語では *barber*）は、Blender 5.1用のヘアースタ
 - 長さに応じて9～13点を自動選択するストランド
 - 根元2セグメントを最長毛基準で揃えるNatural Root Spacing
 - Hair / Body / Clothes / Cutter の明示選択
+- v0.6.8: `Settle With Guide`を一時メッシュ衝突から数式Back Flow Guideへ変更
 - v0.6.7: Back Flow Guideを肩の後ろ下まで延長し、Settleボタン配置を整理
 - v0.6.6: 球の代わりに一時Back Flow Guideを使う`Settle With Guide`
 - v0.6.5: `Trim Bangs`の一時カッターとSettle用Collider Proxyを処理後に削除

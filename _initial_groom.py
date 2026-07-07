@@ -136,6 +136,7 @@ def settle_hair_back(
     surface_stick: float = 0.78,
     push_iterations: int = 5,
     max_turn_angle_rad: float = 1.0,
+    back_flow_guide: dict | None = None,
 ) -> dict:
     if curves_obj is None or curves_obj.type != "CURVES":
         raise ValueError("expected one Curves object")
@@ -243,6 +244,7 @@ def settle_hair_back(
         "normal_root_locks": 0,
         "angle_limited_rods": 0,
         "lower_free_rods": 0,
+        "back_flow_guided_rods": 0,
         "remaining_close_points": 0,
         "changed_points": 0,
         "max_move_m": 0.0,
@@ -252,6 +254,48 @@ def settle_hair_back(
     }
 
     back_down = (BACK * 0.55 + DOWN * 0.83).normalized()
+
+    def smoothstep(t: float) -> float:
+        t = max(0.0, min(1.0, float(t)))
+        return t * t * (3.0 - 2.0 * t)
+
+    def guide_min_y(z: float) -> float | None:
+        if not back_flow_guide:
+            return None
+        z_top = float(back_flow_guide["z_top"])
+        y_top = float(back_flow_guide["y_top"])
+        z_shoulder = float(back_flow_guide["z_shoulder"])
+        y_shoulder = float(back_flow_guide["y_shoulder"])
+        z_low = float(back_flow_guide["z_low"])
+        y_low = float(back_flow_guide["y_low"])
+
+        if z >= z_top:
+            return None
+        if z >= z_shoulder:
+            t = smoothstep((z_top - z) / max(1.0e-6, z_top - z_shoulder))
+            return y_top * (1.0 - t) + y_shoulder * t
+        if z >= z_low:
+            t = smoothstep((z_shoulder - z) / max(1.0e-6, z_shoulder - z_low))
+            return y_shoulder * (1.0 - t) + y_low * t
+        return y_low
+
+    def apply_back_flow_guide(prev: Vector, direction: Vector, seg_len: float) -> Vector:
+        if not back_flow_guide or direction.length <= 1.0e-9 or seg_len <= 1.0e-9:
+            return direction
+        candidate = prev + direction.normalized() * seg_len
+        min_y = guide_min_y(candidate.z)
+        if min_y is None or candidate.y >= min_y:
+            return direction
+
+        z_drop = float(back_flow_guide.get("z_drop_m", 0.015))
+        target_y = max(min_y, prev.y + 1.0e-4)
+        target_z = min(candidate.z - z_drop, prev.z - z_drop * 0.25)
+        guided = Vector((prev.x, target_y, target_z)) - prev
+        if guided.length <= 1.0e-9:
+            guided = BACK * 0.8 + DOWN * 0.2
+        guided.normalize()
+        stats["back_flow_guided_rods"] += 1
+        return guided
 
     def signed_outside_distance(point: Vector, search_radius: float = 0.080) -> float:
         nearest = bvh.find_nearest(point, search_radius)
@@ -708,6 +752,7 @@ def settle_hair_back(
             direction, surface_run, in_surface = choose_direction(new[-1], desired_dir, surface_run, lower_free=lower_free)
             if not in_surface:
                 surface_run = 0.0
+            direction = apply_back_flow_guide(new[-1], direction, seg_len)
             if not lower_free:
                 direction, limited = _limit_turn_direction(prev_dir, direction, max_turn_angle_rad)
                 if limited:
@@ -740,6 +785,7 @@ def settle_hair_back(
                 direction, surface_run, in_surface = choose_direction(new[j], direction, surface_run, lower_free=lower_free)
                 if not in_surface:
                     surface_run = 0.0
+                direction = apply_back_flow_guide(new[j], direction, seg_len)
                 if not lower_free:
                     direction, limited = _limit_turn_direction(prev_dir, direction, max_turn_angle_rad)
                     if limited:
@@ -804,6 +850,7 @@ def settle_hair_back(
         "normal_root_locks": int(stats["normal_root_locks"]),
         "angle_limited_rods": int(stats["angle_limited_rods"]),
         "lower_free_rods": int(stats["lower_free_rods"]),
+        "back_flow_guided_rods": int(stats["back_flow_guided_rods"]),
         "remaining_close_points": int(stats["remaining_close_points"]),
         "min_clearance_mm": None if stats["min_clearance_m"] == 999.0 else stats["min_clearance_m"] * 1000.0,
         "max_move_cm": stats["max_move_m"] * 100.0,
