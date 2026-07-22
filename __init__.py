@@ -1,5 +1,6 @@
 from __future__ import annotations
-import json, math, os, sys
+import json, math, os, subprocess, sys
+from pathlib import Path
 import bpy
 from bpy.props import (
     BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty,
@@ -8,6 +9,12 @@ from bpy.props import (
 from bpy.types import Operator, WindowManager
 from mathutils import Vector
 from . import ui
+
+
+_zozo_process: "subprocess.Popen[str] | None" = None
+_zozo_prepared_summary: str | None = None
+_ZOZO_CLIENT_FILENAME = "_zozo_mcp_client.py"
+_ZOZO_CONFIG_FILENAME = "tokoya_zozo_mcp_config.json"
 
 
 def _load_defaults():
@@ -418,6 +425,44 @@ class TOKOYA_OT_plant_hair(Operator):
         return {"FINISHED"}
 
 
+class TOKOYA_OT_plant_z_axe(Operator):
+    bl_idname      = "tokoya.plant_z_axe"
+    bl_label       = "Plant Z-axe"
+    bl_description = (
+        "Plant strands in flat Z rows: every strand of a row shares one Z value, "
+        "spacing along and between rows follows the painted area"
+    )
+
+    def execute(self, context):
+        wm       = context.window_manager
+        curves_obj = _find_curves_obj(context)
+        if curves_obj is None:
+            self.report({"ERROR"}, "Pick one Hair Curves object")
+            return {"CANCELLED"}
+        ref_obj = bpy.data.objects.get("Tokoya_HairMask")
+        if ref_obj is None:
+            self.report({"ERROR"}, "Create Tokoya_HairMask first"); return {"CANCELLED"}
+        if ref_obj.type != "MESH":
+            self.report({"ERROR"}, "Tokoya_HairMask must be a painted MESH")
+            return {"CANCELLED"}
+        from . import _mask_plant
+        try:
+            r = _mask_plant.plant_z_slice_hair(
+                ref_obj,
+                strand_count=wm.tokoya_strand_count,
+                max_length_cm=wm.tokoya_max_length_cm,
+                curves_obj=curves_obj,
+            )
+        except (ValueError, RuntimeError) as exc:
+            self.report({"ERROR"}, str(exc)); return {"CANCELLED"}
+        self.report({"INFO"},
+            f"Planted {r['n_added']} strands in {r['rows']} Z rows "
+            f"({r['spacing_mm']:.1f} mm spacing). "
+            f"Mean length {r['mean_length_cm']:.1f} cm")
+        _mark_hair_changed()
+        return {"FINISHED"}
+
+
 class TOKOYA_OT_simulate(Operator):
     bl_idname      = "tokoya.simulate"
     bl_label       = "Settle Hair Back"
@@ -657,6 +702,131 @@ class TOKOYA_OT_pick_cutter(Operator):
         return {"FINISHED"}
 
 
+def _zozo_data_dir():
+    return bpy.utils.user_resource("DATAFILES", path="tokoya", create=True)
+
+
+def _zozo_environment():
+    environment = os.environ.copy()
+    inherited = [path for path in sys.path if isinstance(path, str) and path]
+    existing = environment.get("PYTHONPATH")
+    if existing:
+        inherited.append(existing)
+    environment["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(inherited))
+    return environment
+
+
+def _set_zozo_status(message: str) -> None:
+    wm = getattr(bpy.context, "window_manager", None)
+    if wm is not None and hasattr(wm, "tokoya_zozo_status"):
+        wm.tokoya_zozo_status = message
+
+
+def _poll_zozo_mcp():
+    global _zozo_process, _zozo_prepared_summary
+    from ._zozo_handoff import ZOZO_MCP_PORT
+
+    process = _zozo_process
+    if process is None:
+        return None
+    if process.poll() is None:
+        return 0.2
+
+    stdout, stderr = process.communicate()
+    summary = _zozo_prepared_summary or "Prepared the ZOZO hand-off"
+    try:
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        result = json.loads(lines[-1]) if lines else {}
+        if process.returncode != 0 or result.get("status") != "success":
+            diagnostic = str(result.get("message") or stderr.strip() or "ZOZO MCP setup failed.")
+            _set_zozo_status(
+                f"{summary}; start ZOZO MCP on :{ZOZO_MCP_PORT} and Prepare again: {diagnostic[:150]}"
+            )
+        else:
+            capture = str(result.get("capture", "not needed"))
+            _set_zozo_status(f"{summary}; ZOZO MCP ready ({capture}). Use Transfer, then Run Simulation.")
+    except Exception as exc:
+        diagnostic = stderr.strip() or stdout.strip() or str(exc)
+        _set_zozo_status(f"{summary}; ZOZO MCP response failed: {diagnostic[:170]}")
+    finally:
+        _zozo_process = None
+        _zozo_prepared_summary = None
+    return None
+
+
+class TOKOYA_OT_prepare_zozo(Operator):
+    bl_idname = "tokoya.prepare_zozo"
+    bl_label = "Prepare for ZOZO"
+    bl_description = (
+        "Create a solver-owned rod (edge-mesh) copy of the hair and an animated "
+        "Body copy, then configure ZOZO Contact Solver through its MCP server"
+    )
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "OBJECT"
+
+    def execute(self, context):
+        global _zozo_process, _zozo_prepared_summary
+        from ._zozo_handoff import ZOZO_MCP_PORT, ZozoHandoffError, prepare_for_zozo
+
+        wm = context.window_manager
+        if _zozo_process is not None and _zozo_process.poll() is None:
+            self.report({"WARNING"}, "ZOZO MCP configuration is already running.")
+            return {"CANCELLED"}
+
+        curves_obj = _find_curves_obj(context)
+        body = _source_body_collider(context)
+        try:
+            prepared = prepare_for_zozo(context, curves_obj, body)
+        except ZozoHandoffError as exc:
+            message = str(exc).strip() or type(exc).__name__
+            wm.tokoya_zozo_status = f"Prepare for ZOZO failed: {message[:220]}"
+            self.report({"ERROR"}, message)
+            return {"CANCELLED"}
+        except Exception as exc:  # noqa: BLE001 - surface any failure to the user
+            message = str(exc).strip() or type(exc).__name__
+            wm.tokoya_zozo_status = f"Prepare for ZOZO failed: {message[:220]}"
+            self.report({"ERROR"}, message)
+            return {"CANCELLED"}
+
+        summary = (
+            f"Prepared {prepared.strand_count} rods "
+            f"({prepared.point_count} points)"
+        )
+        try:
+            config_path = Path(_zozo_data_dir()) / _ZOZO_CONFIG_FILENAME
+            config_path.write_text(
+                json.dumps(prepared.mcp_configuration(context.scene), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            client_path = Path(__file__).with_name(_ZOZO_CLIENT_FILENAME)
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            _zozo_process = subprocess.Popen(
+                [_blender_python_exe(), str(client_path), str(config_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=creationflags,
+                env=_zozo_environment(),
+            )
+            _zozo_prepared_summary = summary
+            wm.tokoya_zozo_status = f"{summary}; configuring ZOZO MCP on :{ZOZO_MCP_PORT}..."
+            if not bpy.app.timers.is_registered(_poll_zozo_mcp):
+                bpy.app.timers.register(_poll_zozo_mcp, first_interval=0.2)
+            self.report({"INFO"}, f"{summary}; configuring ZOZO.")
+        except Exception as exc:  # noqa: BLE001 - copies are ready even if MCP fails
+            message = str(exc).strip() or type(exc).__name__
+            wm.tokoya_zozo_status = (
+                f"{summary}; copies are ready, but MCP could not start: {message[:160]}"
+            )
+            self.report({"WARNING"}, wm.tokoya_zozo_status)
+        return {"FINISHED"}
+
+
 def _blender_python_exe():
     base = os.path.join(sys.prefix, "bin")
     win = os.path.join(base, "python.exe")
@@ -715,11 +885,13 @@ class TOKOYA_AddonPreferences(bpy.types.AddonPreferences):
 _classes = (
     TOKOYA_OT_create_head_mask,
     TOKOYA_OT_plant_hair,
+    TOKOYA_OT_plant_z_axe,
     TOKOYA_OT_simulate,
     TOKOYA_OT_settle_with_guide,
     TOKOYA_OT_mesh_shrink,
     TOKOYA_OT_trim_bangs,
     TOKOYA_OT_urchin_reset,
+    TOKOYA_OT_prepare_zozo,
     TOKOYA_OT_pick_hair,
     TOKOYA_OT_pick_body,
     TOKOYA_OT_pick_clothes,
@@ -784,6 +956,9 @@ def register():
         WindowManager.tokoya_cutter_obj = StringProperty(
             name="Cutter Mesh", description="Mesh used by Mesh Shrink",
             default="", options={"SKIP_SAVE"})
+        WindowManager.tokoya_zozo_status = StringProperty(
+            name="ZOZO Status", description="Latest ZOZO hand-off status",
+            default="Ready", options={"SKIP_SAVE"})
         WindowManager.tokoya_bangs_side_extra_cm = FloatProperty(
             name="Side + cm",
             description="Extra width added to both eye-width ends for Trim Bangs",
@@ -848,6 +1023,7 @@ def register():
             "tokoya_simulation_steps", "tokoya_compute_backend",
             "tokoya_hair_obj", "tokoya_body_obj", "tokoya_clothes_obj",
             "tokoya_collider_proxy_obj", "tokoya_cutter_obj",
+            "tokoya_zozo_status",
             "tokoya_bangs_side_extra_cm", "tokoya_bangs_z_extra_cm",
             "tokoya_groom_radius_mm", "tokoya_groom_follow_mm",
             "tokoya_groom_release_mm",
@@ -869,13 +1045,21 @@ def register():
 
 
 def unregister():
+    global _zozo_process, _zozo_prepared_summary
     _uninstall_handlers()
+    if bpy.app.timers.is_registered(_poll_zozo_mcp):
+        bpy.app.timers.unregister(_poll_zozo_mcp)
+    if _zozo_process is not None and _zozo_process.poll() is None:
+        _zozo_process.terminate()
+    _zozo_process = None
+    _zozo_prepared_summary = None
     ui.unregister()
     for name in (
         "tokoya_strand_count", "tokoya_max_length_cm",
         "tokoya_simulation_steps", "tokoya_compute_backend",
         "tokoya_hair_obj", "tokoya_body_obj", "tokoya_clothes_obj",
         "tokoya_collider_proxy_obj", "tokoya_cutter_obj",
+        "tokoya_zozo_status",
         "tokoya_bangs_side_extra_cm", "tokoya_bangs_z_extra_cm",
         "tokoya_groom_radius_mm", "tokoya_groom_follow_mm",
         "tokoya_groom_release_mm",

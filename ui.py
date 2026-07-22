@@ -76,7 +76,9 @@ class TOKOYA_PT_main(Panel):
 
         # Main buttons
         col = layout.column(align=True)
-        _operator(col, "tokoya.plant_hair", icon="OUTLINER_OB_CURVES")
+        row = col.row(align=True)
+        _operator(row, "tokoya.plant_hair", icon="OUTLINER_OB_CURVES")
+        _operator(row, "tokoya.plant_z_axe", icon="MOD_ARRAY")
 
         box = layout.box()
         _label(box, "Settle Hair Back")
@@ -99,6 +101,12 @@ class TOKOYA_PT_main(Panel):
         _operator(col, "tokoya.trim_bangs", icon="MOD_SOLIDIFY")
         col.separator()
         _operator(col, "tokoya.urchin_reset", icon="FORCE_FORCE")
+
+        box = layout.box()
+        _label(box, "ZOZO Hand-off")
+        col = box.column(align=True)
+        _operator(col, "tokoya.prepare_zozo", icon="EXPORT")
+        _label(box, getattr(wm, "tokoya_zozo_status", "Ready"))
 
 
 _classes = (TOKOYA_PT_main,)
